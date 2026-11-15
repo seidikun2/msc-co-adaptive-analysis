@@ -164,6 +164,36 @@ def test_reference_does_not_substitute_cue_when_motor_onset_is_missing(cfg):
     plt.close(fig)
 
 
+def test_raw_comparison_uses_the_same_motor_zero_as_marker_reference(cfg):
+    from eeg_figures import raw_plot
+    import matplotlib.pyplot as plt
+    rec = recording(cfg)
+    meta = dict(subject="SYNTHETIC", group="demo", session=1, block="im")
+    block, trials, raw, filtered, _ = prepare_block(rec, cfg, meta)
+    fig = raw_plot(rec, raw, filtered, block, trials, cfg)
+    for ax in fig.axes:
+        assert ax.get_xlabel() == "Tempo desde o início da execução / imagética (s)"
+        trace = ax.lines[0]
+        np.testing.assert_allclose(trace.get_xdata()[0], -3.)
+        motor_markers = [line for line in ax.lines if line.get_color() == "#009E73"]
+        assert any(np.all(np.asarray(line.get_xdata()) == 0.) for line in motor_markers)
+    plt.close(fig)
+
+
+def test_raw_without_motor_marker_shows_absolute_time(cfg):
+    from eeg_figures import raw_plot
+    import matplotlib.pyplot as plt
+    rec = recording(cfg)
+    cfg["events"]["task_start"] = []
+    meta = dict(subject="SYNTHETIC", group="demo", session=1, block="im")
+    block, trials, raw, filtered, _ = prepare_block(rec, cfg, meta)
+    fig = raw_plot(rec, raw, filtered, block, trials, cfg)
+    for ax in fig.axes:
+        assert ax.get_xlabel() == "Tempo no arquivo (s) · início motor não identificado"
+        np.testing.assert_allclose(ax.lines[0].get_xdata()[0], 2.5)
+    plt.close(fig)
+
+
 def test_erd_is_minus_75_percent_when_amplitude_halves(cfg):
     fs = 128
     times = np.arange(4*fs)/fs

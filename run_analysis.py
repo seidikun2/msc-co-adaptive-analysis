@@ -45,7 +45,9 @@ def _draw_block(report, rec, raw, filtered, block, trials, events, summary, powe
     report.figure(raw_plot(rec, raw, filtered, block, trials, cfg), title+" · EEG bruto e pré-processado",
                   "Mesma janela, canais e escala. Mediana removida por canal somente para exibição. "
                   "Filtro IIR causal contínuo e referência configurada; não há ICA nem correção de EOG. "
-                  "Linhas: atenção em cinza e cue na cor da classe. O filtro causal introduz atraso de fase.")
+                  "Zero no início da execução/imagética da tentativa de referência. Sem marcador motor, "
+                  "o eixo mostra o tempo absoluto no arquivo. Linhas: atenção em cinza, cue na cor da classe "
+                  "e início motor em verde. O filtro causal introduz atraso de fase.")
     report.figure(timing_plot(trials, events), title+" · Organização temporal das tentativas",
                   "Uma janela de referência, com fundos coloridos e linhas verticais nos tempos dos eventos. "
                   "Zero no início da execução/imagética; atenção e cue anteriores têm tempos negativos. "
