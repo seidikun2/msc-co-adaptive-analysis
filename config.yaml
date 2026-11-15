@@ -1,0 +1,86 @@
+paths:
+  data: data
+  output: results
+  manifest: null  # CSV criado por `inspect`, preenchido com subject, session, block, group
+
+input:
+  # Convenção confirmada: motor_me_EG102_1, motor_mi_EG102_1, motor_mi_EG102_online_1a.
+  # null usa essa convenção; regex customizado deve ter subject/session/block.
+  filename_regex: null
+  separator: auto
+  decimal: '.'
+  eeg_unit: native     # unidade desconhecida: native (u.a.); depois confirmar V, mV ou uV
+  channels: [Channel 1, Channel 2, Channel 3, Channel 4, Channel 5, Channel 6,
+             Channel 7, Channel 8, Channel 9, Channel 10, Channel 11, Channel 12,
+             Channel 13, Channel 14, Channel 15, Channel 16] # Aux 1/2 excluídos
+  # ATENÇÃO: lista ARTIFICIAL, fornecida apenas para exercitar a visualização.
+  # Substitua pela ordem REAL da touca antes de interpretar mapas/lateralidade.
+  channel_names: [Fz, FC3, FC1, FCz, FC2, FC4, C3, C1, Cz, C2, C4, CP3, CP1, CPz, CP2, CP4]
+  time_column: null   # null = detectar Time:512Hz, Time (s), etc.
+  event_id_column: null
+  event_date_column: null
+  event_duration_column: null
+  event_time: absolute # absolute, row ou relative_to_row
+  sfreq: null         # null = cabeçalho Time:...Hz, conferido pelos timestamps
+
+events:
+  # Aceita inteiros decimais ou hexadecimais. Confirme as ocorrências em `inspect`.
+  attention: []        # OBRIGATÓRIO: código real do momento de atenção
+  left: [769]         # OpenViBE/GDF_Left = 0x0301
+  right: [770]        # OpenViBE/GDF_Right = 0x0302
+  trial_start: [768, 32773]
+  task_start: []      # se existir um marcador separado da cue, informe aqui
+  rest_start: [32777] # OpenViBE RestStart = 0x8009; confirme no seu cenário
+  trial_stop: [800, 32774]
+
+preprocessing:
+  bandpass_hz: [1.0, 40.0]
+  order: 4
+  notch_hz: null          # 50 ou 60 conforme a aquisição; null = desligado
+  reference: average     # average ou original
+  bad_channels: []       # nomes originais OU nomes renomeados
+  settling_s: 2.0        # não usar tentativas dentro do transitório inicial
+  reject_peak_to_peak_uv: 200.0 # só aplicado se eeg_unit != native
+  reject_flat_std_uv: 0.05     # em native só detecta canal exatamente constante
+  # Filtro causal, contínuo, com parâmetros fixos: não usa amostras futuras.
+
+epochs:
+  anchor: cue            # cue ou task_start; task_start exige marcador correspondente
+  baseline_start_s: 0.2  # após a atenção; baseline termina antes da cue
+  baseline_end_before_cue_s: 0.2
+  min_baseline_s: 1.0
+  activity_s: [0.5, 4.5] # em relação ao anchor
+  classification_s: [0.5, 2.5] # UMA janela de exatamente 2 s por tentativa
+
+spectral:
+  bands:
+    mu: [8.0, 13.0]
+    beta: [13.0, 30.0]
+  welch_window_s: 1.0
+  overlap: 0.5
+  tfr_window_s: 1.0
+  tfr_step_s: 0.1
+  tfr_range_s: [-2.0, 4.5] # relativo à cue, inclusive se anchor = task_start
+  display_hz: [3.0, 40.0]
+  channels_of_interest: [C3, C4]
+
+classification:
+  enabled: true
+  frequency_hz: [8.0, 30.0]
+  cv_folds: 5
+  cv_scheme: stratified   # stratified ou forward (TimeSeriesSplit)
+  blas_threads: 1         # matrizes pequenas: evita paralelismo excessivo
+  csp_components: 4
+  svm_C: 1.0
+  online_svm_kernel: rbf  # linear ou rbf; hiperparâmetros fixos, sem seleção no teste
+  seed: 42
+  allow_protocol_gaps: false # protocolo para na primeira lacuna; não inventa atualizações
+
+figures:
+  selection: first_per_kind # primeiro me, primeiro im, primeiro online; all = todos
+  raw_seconds: 12.0
+  raw_channels: 6
+  montage: colin27_1020
+  montage_confirmed: false # true SOMENTE após substituir/verificar a lista acima
+  dpi: 150
+  bootstrap_samples: 500
