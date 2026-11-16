@@ -91,12 +91,26 @@ def _bootstrap(values, cfg):
         return np.nanmean(values, axis=0), *np.nanpercentile(dist, [2.5, 97.5], axis=0)
 
 
+def _motor_reference(trials):
+    good = trials.loc[trials.cue_s.notna() & trials.task_start_s.notna()]
+    accepted = good.loc[good.status == "accepted"]
+    return (accepted if len(accepted) else good).iloc[0] if len(good) else None
+
+
 def raw_plot(rec, raw, filtered, block, trials, cfg):
     fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharex=True, sharey=True)
+    reference = _motor_reference(trials)
     first = trials.loc[trials.status == "accepted"]
-    attention = first.attention_s.iloc[0] if len(first) else trials.attention_s.iloc[0]
+    attention = (reference.attention_s if reference is not None else
+                 first.attention_s.iloc[0] if len(first) else trials.attention_s.iloc[0])
+    origin = reference.task_start_s if reference is not None else 0.
+    xlabel = ("Tempo desde o início da execução / imagética (s)" if reference is not None else
+              "Tempo no arquivo (s) · início motor não identificado")
     start = max(rec.times[0], attention-.5)
+    if reference is not None:
+        start = max(start, origin-cfg["figures"]["raw_seconds"]/2)
     mask = (rec.times >= start) & (rec.times < start+cfg["figures"]["raw_seconds"])
+    times = rec.times[mask]-origin
     n = min(len(block.channels), cfg["figures"]["raw_channels"])
     before, after = raw[:n, mask]*1e6, filtered[:n, mask]*1e6
     before -= np.median(before, axis=1, keepdims=True)
@@ -106,34 +120,34 @@ def raw_plot(rec, raw, filtered, block, trials, cfg):
     offsets = np.arange(n)[::-1]*spacing
     for ax, data, title in zip(axes, (before, after), ("Bruto", "Pré-processado (causal)")):
         for ch in range(n):
-            ax.plot(rec.times[mask]-attention, data[ch]+offsets[ch], lw=.55, color="#263238")
+            ax.plot(times, data[ch]+offsets[ch], lw=.55, color="#263238")
         ax.set_yticks(offsets, block.channels[:n])
-        ax.set_xlabel("Tempo desde a atenção (s)")
+        ax.set_xlabel(xlabel)
         ax.set_title(title)
         ax.grid(axis="x", alpha=.2)
         for tr in trials.itertuples():
-            if attention-.5 <= tr.attention_s <= start+cfg["figures"]["raw_seconds"]:
-                ax.axvline(tr.attention_s-attention, color="gray", ls=":", lw=.8)
-                if np.isfinite(tr.cue_s):
-                    ax.axvline(tr.cue_s-attention, color=COLORS.get(tr.label, "gray"), lw=.9)
-        ax.plot([.1, .1], [offsets[0]+spacing*.2, offsets[0]+spacing*.2+20], color="k", lw=2)
-        ax.text(.2, offsets[0]+spacing*.2, f"20 {amplitude_unit(cfg)}", va="bottom")
+            for when, color, style in ((tr.attention_s, "gray", ":"),
+                                       (tr.cue_s, COLORS.get(tr.label, "gray"), "-"),
+                                       (tr.task_start_s, "#009E73", "--")):
+                if np.isfinite(when) and start <= when < start+cfg["figures"]["raw_seconds"]:
+                    ax.axvline(when-origin, color=color, ls=style, lw=.9)
+        bar_x = times[0]+.4
+        ax.plot([bar_x, bar_x], [offsets[0]+spacing*.2, offsets[0]+spacing*.2+20], color="k", lw=2)
+        ax.text(bar_x+.1, offsets[0]+spacing*.2, f"20 {amplitude_unit(cfg)}", va="bottom")
     return fig
 
 
 def timing_plot(trials, events):
     """Uma referência com t=0 no início motor; identidade da classe vem da cue."""
-    good = trials.loc[trials.cue_s.notna() & trials.task_start_s.notna()]
-    accepted = good.loc[good.status == "accepted"]
     fig, axes = plt.subplots(2, 1, figsize=(11, 5.6), gridspec_kw={"height_ratios": [1.4, 1.6]})
-    if good.empty:
+    tr = _motor_reference(trials)
+    if tr is None:
         axes[0].text(.5, .5, "Nenhuma sequência com cue e início motor identificáveis.\n"
                      "Configure events.task_start para definir o início da execução/imagética como t = 0.",
                      ha="center", va="center", transform=axes[0].transAxes)
         axes[0].axis("off")
         axes[1].set_visible(False)
         return fig
-    tr = (accepted if len(accepted) else good).iloc[0]
     ax = axes[0]
     origin, cue, end = tr.task_start_s, tr.cue_s, tr.period_end_s
     task, rest = tr.task_start_s, tr.rest_s
@@ -163,7 +177,7 @@ def timing_plot(trials, events):
     for ev in rows.itertuples():
         delta = ev.time_s-origin
         xmin = min(xmin, delta)
-        color = class_color if ev.event_name in {"left", "right"} else "#444444"
+        color = "#009E73" if ev.time_s == origin else class_color if ev.event_name in {"left", "right"} else "#444444"
         width = 2. if ev.time_s == origin else 1.4 if ev.event_name in {"left", "right"} else .9
         ax.axvline(delta, color=color, lw=width, ls="-")
         text_rows.append([translations.get(ev.event_name, ev.event_name), f"{int(ev.code)} / 0x{int(ev.code):04X}",
@@ -177,6 +191,7 @@ def timing_plot(trials, events):
     ax.set_xlabel("Tempo desde o início da execução / imagética (s)")
     ax.set_title(f"Uma janela de referência · tentativa {int(tr.trial)} · início motor = 0 s")
     ax.text(cue-origin+.06, .90, f"Cue: {LABELS[tr.label]}", color=class_color, fontsize=9, weight="bold")
+    ax.text(.06, .75, "0 s = início da execução / imagética", color="#007A59", fontsize=9, weight="bold")
     ax.grid(axis="x", alpha=.15)
     axes[1].axis("off")
     table = axes[1].table(cellText=text_rows, colLabels=["Marcador", "Código decimal / hex",
@@ -189,6 +204,9 @@ def timing_plot(trials, events):
         cell.set_edgecolor("#DDDDDD")
         if row == 0:
             cell.set_facecolor("#EEEEEE")
+        elif text_rows[row-1][2] == "0.0000000000":
+            cell.set_facecolor("#DDF3E9")
+            cell.get_text().set_weight("bold")
     fig.text(.5, .01, baseline_text, ha="center", fontsize=9)
     return fig
 

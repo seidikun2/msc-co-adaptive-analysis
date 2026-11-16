@@ -154,6 +154,8 @@ O caminho de leitura do código é `eeg_io.py` → `eeg_processing.py` →
 
 - EEG bruto e depois do bandpass de 1–40 Hz, notch opcional e referência média
   opcional. Mesmos canais, janela e escala; o bruto é centrado apenas para exibição.
+  O eixo usa o início da execução/imagética da tentativa de referência como zero.
+  Sem esse marcador, mostra o tempo absoluto no arquivo com aviso explícito.
 - Uma **janela de referência dos marcadores**, com fundos coloridos para
   atenção/cue/tarefa/pausa e linhas verticais nas marcações, sem bolinhas. Uma
   tabela dentro da imagem mostra tempos com dez casas decimais, tanto absolutos
@@ -167,6 +169,10 @@ O caminho de leitura do código é `eeg_io.py` → `eeg_processing.py` →
   absolutos e relativos à baseline; curvas ERD/ERS de mu (8–13 Hz) e beta (13–30 Hz).
 - Topografia da potência e do ERD no **escalpo**. Isso não é uma reconstrução de
   fontes corticais; posições artificiais não sustentam conclusões anatômicas.
+
+Referência visual com **dados sintéticos**, também disponível em `marker_reference.png`:
+
+![Sequência sintética: atenção e cue negativas, início motor em zero](marker_reference.png)
 
 A baseline de **cada tentativa** é:
 
