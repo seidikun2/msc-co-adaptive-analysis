@@ -22,6 +22,15 @@ class EmptyRecordingError(ValueError):
     """CSV sem cabeçalho; só pode ser omitido mediante opção explícita."""
 
 
+class InvalidEEGError(ValueError):
+    """Amostras inválidas; detalhes não contêm valores do sinal."""
+
+    def __init__(self, path, reason, details):
+        self.details = details
+        super().__init__(f"EEG inválido em {path}: {reason}. Diagnóstico: {details}. "
+                         "Nenhuma amostra foi interpolada ou reparada.")
+
+
 def is_auxiliary_csv(path):
     return Path(path).name.casefold() in AUXILIARY_CSVS
 
@@ -155,10 +164,21 @@ def read_recording(path, cfg):
     x = signals.loc[valid].to_numpy(dtype=float).T
     t = times.loc[valid].to_numpy(dtype=float)
     if len(t) < 3 or not np.isfinite(x).all() or not np.isfinite(t).all():
-        raise ValueError("EEG insuficiente, NaN/Inf ou amostras parcialmente ausentes.")
+        bad_channels = {str(c): int((~np.isfinite(x[i])).sum()) for i, c in enumerate(channels)
+                        if not np.isfinite(x[i]).all()}
+        bad_rows = (~np.isfinite(x)).any(axis=0) | ~np.isfinite(t)
+        details = dict(n_rows=len(frame), n_eeg_samples=len(t), min_eeg_samples=3,
+                       n_rows_without_eeg=int((~valid).sum()),
+                       n_nan_eeg=int(np.isnan(x).sum()), n_inf_eeg=int(np.isinf(x).sum()),
+                       n_nonfinite_timestamps=int((~np.isfinite(t)).sum()),
+                       invalid_cells_by_channel=bad_channels,
+                       first_bad_data_indices=frame.index[valid][bad_rows].tolist()[:10],
+                       event_counts={str(int(k)): int(v) for k, v in events.code.value_counts().items()})
+        raise InvalidEEGError(path, "EEG insuficiente, NaN/Inf ou amostras parcialmente ausentes", details)
     dt = np.diff(t)
     if (dt <= 0).any():
-        raise ValueError("Timestamps do EEG não são estritamente crescentes.")
+        raise InvalidEEGError(path, "Timestamps do EEG não são estritamente crescentes",
+                              dict(n_nonincreasing_steps=int((dt <= 0).sum())))
     inferred = 1. / np.median(dt)
     pin = re.search(r"([\d.]+)\s*Hz", time_col, flags=re.I)
     fs = float(options.get("sfreq") or (pin.group(1) if pin else inferred))

@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from eeg_io import BLOCKS, EmptyRecordingError, discover, inspect_folder, load_config, read_recording
+from eeg_io import BLOCKS, EmptyRecordingError, InvalidEEGError, discover, inspect_folder, load_config, read_recording
 from eeg_processing import MissingAttentionError, event_table, prepare_block, spectral_summary, validate_config
 from eeg_classification import classify_subject
 
@@ -124,7 +124,7 @@ def _draw_block(report, rec, raw, filtered, block, trials, events, summary, powe
                       "Posições artificiais não permitem interpretação anatômica.")
 
 
-def analyze_subject(table, cfg, overwrite=False, skip_empty=False, skip_missing_attention=False):
+def analyze_subject(table, cfg, overwrite=False, skip_empty=False, skip_missing_attention=False, skip_invalid_eeg=False):
     from eeg_figures import Report, classification_figures
     subject = str(table.subject.iloc[0])
     root = Path(cfg["paths"]["output"])
@@ -150,14 +150,18 @@ def analyze_subject(table, cfg, overwrite=False, skip_empty=False, skip_missing_
             print(f"{subject} · sessão {row.session} · {row.block}: lendo {Path(row.path).name}", flush=True)
             try:
                 rec = read_recording(row.path, cfg)
-            except EmptyRecordingError as exc:
-                if not skip_empty:
+            except (EmptyRecordingError, InvalidEEGError) as exc:
+                empty = isinstance(exc, EmptyRecordingError)
+                if not (skip_empty if empty else skip_invalid_eeg):
                     raise
-                message = f"EXECUÇÃO PARCIAL — arquivo vazio omitido: {row.path}: {exc}"
+                status = "skipped_empty" if empty else "skipped_invalid_eeg"
+                label = "arquivo vazio omitido" if empty else "EEG inválido omitido"
+                message = f"EXECUÇÃO PARCIAL — {label}: {exc}"
                 print(message, flush=True)
                 report.text(message)
                 inventory.append(dict(**meta, path=row.path, sha256=_sha256(row.path),
-                                      status="skipped_empty", error=str(exc), n_trials=0,
+                                      status=status, error=str(exc), n_trials=0 if empty else np.nan,
+                                      validation_details=json.dumps(getattr(exc, "details", {}), ensure_ascii=False),
                                       n_accepted=0, n_eda_accepted=0, duplicate_paths=row.duplicate_paths,
                                       duplicate_entries=row.duplicate_entries, duplicate_sha256=row.duplicate_sha256))
                 continue
@@ -357,11 +361,13 @@ def main():
                         help="Em run, omitir CSVs vazios com registro de execução parcial; outros erros continuam fatais.")
     parser.add_argument("--skip-missing-attention", action="store_true",
                         help="Em run, omitir gravações sem o código de atenção, preservando marcadores e registro de execução parcial.")
+    parser.add_argument("--skip-invalid-eeg", action="store_true",
+                        help="Em run, omitir EEG insuficiente, NaN/Inf ou timestamps não crescentes, com diagnóstico no inventário.")
     parser.add_argument("--activity-window", type=float, nargs=2, metavar=("START", "STOP"),
                         help="Janela EDA fixa em segundos após o anchor; não altera os 2 s da classificação.")
     parser.add_argument("--overwrite", action="store_true", help="Substituir somente os arquivos de saída gerados.")
     args = parser.parse_args()
-    if (args.skip_empty or args.skip_missing_attention) and args.command != "run":
+    if (args.skip_empty or args.skip_missing_attention or args.skip_invalid_eeg) and args.command != "run":
         raise ValueError("Opções --skip-* são exclusivas de run; inspect/diagnose sempre registram os erros.")
     cfg = load_config(args.config)
     if args.activity_window is not None:
@@ -401,7 +407,8 @@ def main():
             diagnose(table, cfg, Path(cfg["paths"]["output"]) / "diagnostics.json", args.overwrite)
         else:
             for _, subject_table in table.groupby("subject", sort=True):
-                analyze_subject(subject_table, cfg, args.overwrite, args.skip_empty, args.skip_missing_attention)
+                analyze_subject(subject_table, cfg, args.overwrite, args.skip_empty, args.skip_missing_attention,
+                                args.skip_invalid_eeg)
 
 
 if __name__ == "__main__":

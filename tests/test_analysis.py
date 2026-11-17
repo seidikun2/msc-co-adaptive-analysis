@@ -402,6 +402,10 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
     frame = pd.read_csv(missing_attention, dtype={'Event Id': str, 'Event Date': str})
     frame.loc[frame['Event Id'] == '33024', ['Event Id', 'Event Date', 'Event Duration']] = np.nan
     frame.to_csv(missing_attention, index=False)
+    invalid_eeg = data / 'SYNTHETIC' / 'motor_mi_SYNTHETIC_2.csv'
+    frame = pd.read_csv(invalid_eeg)
+    frame.loc[3, 'Channel 2'] = np.nan
+    frame.to_csv(invalid_eeg, index=False)
     original = data / 'SYNTHETIC' / 'motor_mi_SYNTHETIC_1.csv'
     copy = data / 'copies' / original.name
     copy.parent.mkdir()
@@ -421,13 +425,13 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
              'inspect' if command == 'inspect' else 'run',
              '--config', str(synthetic / 'config.yaml'), '--data', str(data),
              '--output', str(output), '--exclude', 'motor_me_EMPTY_1.csv',
-             *(['--exclude', 'SYNTHETIC/motor_me_SYNTHETIC_3.csv'] if command == 'inspect'
-               else ['--skip-empty', '--skip-missing-attention']), *extra],
+             *(['--exclude', 'SYNTHETIC/motor_me_SYNTHETIC_3.csv', '--exclude', 'SYNTHETIC/motor_mi_SYNTHETIC_2.csv']
+               if command == 'inspect' else ['--skip-empty', '--skip-missing-attention', '--skip-invalid-eeg']), *extra],
             cwd=project, env=environment, capture_output=True, text=True, timeout=180)
         assert result.returncode == 0, result.stdout + result.stderr
         if command == 'inspect':
             inventory = pd.read_csv(output / 'inventory.csv')
-            assert len(inventory) == 12
+            assert len(inventory) == 11
             assert inventory.error.isna().all()
         else:
             folder = output / 'SYNTHETIC'
@@ -440,13 +444,15 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
                 assert inventory.loc[inventory.status == 'skipped_empty', 'block'].tolist() == ['me']
                 omitted = inventory.loc[inventory.status == 'skipped_missing_attention']
                 assert omitted.session.tolist() == [2] and omitted.n_trials.isna().all()
+                invalid = inventory.loc[inventory.status == 'skipped_invalid_eeg']
+                assert invalid.block.tolist() == ['im'] and invalid.session.tolist() == [2]
                 trials = pd.read_csv(archive.open('trials.csv'))
                 events = pd.read_csv(archive.open('events.csv'))
                 unmatched = events.loc[(events.session == 2) & (events.block == 'me')]
                 assert len(unmatched) > 0 and unmatched.trial_id.isna().all()
                 scores = pd.read_csv(archive.open('scores.csv'))
                 powers = pd.read_csv(archive.open('bandpower.csv'))
-                assert len(trials) == 88
+                assert len(trials) == 80
                 online = trials.block.str.startswith('online_')
                 assert trials.loc[online, 'status'].eq('accepted').all()
                 if command == 'eda_short':
@@ -456,7 +462,10 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
                     assert trials.loc[online, 'eda_status'].eq('excluded').all()
                     assert not powers.block.str.startswith('online_').any()
                 if command == 'full':
-                    assert len(scores) > 0 and set(scores.status) == {'ok'}
+                    assert len(scores) > 0 and set(scores.status) == {'ok', 'skipped'}
+                    skipped = scores.loc[scores.status == 'skipped']
+                    assert set(skipped.experiment) == {'session_im_frozen'}
+                    assert skipped.session.eq(2).all()
                     adaptive = scores.loc[scores.experiment == 'adaptive_protocol']
                     assert len(adaptive) == 8 and adaptive.n_test.eq(8).all()
                 else:
@@ -816,3 +825,67 @@ def test_missing_attention_omission_keeps_markers_and_stops_adaptive_gap(tmp_pat
     adaptive = scores.loc[scores.experiment == 'adaptive_protocol']
     assert adaptive.status.tolist() == ['skipped']
     assert 'online_a' in adaptive.iloc[0].reason
+
+
+@pytest.mark.parametrize('column,value', [('Channel 2', np.nan), ('Channel 3', np.inf),
+                                         ('Time:128Hz', np.nan)])
+def test_invalid_eeg_reports_nonfinite_counts_channels_and_indices(tmp_path, cfg, column, value):
+    from eeg_io import InvalidEEGError
+    frame = pd.DataFrame({c: np.arange(8, dtype=float) for c in cfg['input']['channels']})
+    frame.insert(0, 'Time:128Hz', np.arange(8)/128)
+    frame.loc[3, column] = value
+    path = tmp_path / 'motor_mi_TEST_4.csv'
+    frame.to_csv(path, index=False)
+    before = path.read_bytes()
+    with pytest.raises(InvalidEEGError) as caught:
+        read_recording(path, cfg)
+    assert str(path) in str(caught.value)
+    details = caught.value.details
+    assert details['n_eeg_samples'] == 8 and details['first_bad_data_indices'] == [3]
+    if column.startswith('Time'):
+        assert details['n_nonfinite_timestamps'] == 1
+    else:
+        assert details['invalid_cells_by_channel'] == {column: 1}
+        assert details['n_nan_eeg'] + details['n_inf_eeg'] == 1
+    assert path.read_bytes() == before
+
+
+def test_insufficient_eeg_is_distinct_from_nonfinite_samples(tmp_path, cfg):
+    from eeg_io import InvalidEEGError
+    frame = pd.DataFrame({c: [1., 2.] for c in cfg['input']['channels']})
+    frame.insert(0, 'Time:128Hz', [0., 1/128])
+    path = tmp_path / 'motor_mi_TEST_4.csv'
+    frame.to_csv(path, index=False)
+    with pytest.raises(InvalidEEGError) as caught:
+        read_recording(path, cfg)
+    assert caught.value.details['n_eeg_samples'] == 2
+    assert caught.value.details['n_nan_eeg'] == caught.value.details['n_inf_eeg'] == 0
+
+
+def test_invalid_eeg_skip_is_explicit_audited_and_cannot_hide_config_errors(tmp_path, cfg):
+    import json
+    from zipfile import ZipFile
+    from eeg_io import InvalidEEGError
+    from run_analysis import analyze_subject
+    frame = pd.DataFrame({c: np.arange(8, dtype=float) for c in cfg['input']['channels']})
+    frame.insert(0, 'Time:128Hz', np.arange(8)/128)
+    frame.loc[3, 'Channel 2'] = np.nan
+    path = tmp_path / 'motor_mi_TEST_4.csv'
+    frame.to_csv(path, index=False)
+    cfg['paths'].update(data=str(tmp_path), output=str(tmp_path / 'results'), manifest=None)
+    table = discover(cfg)
+    with pytest.raises(InvalidEEGError):
+        analyze_subject(table, cfg, skip_empty=True, skip_missing_attention=True)
+    analyze_subject(table, cfg, skip_invalid_eeg=True)
+    target = tmp_path / 'results' / 'TEST'
+    assert json.loads((target / 'run-info.json').read_text())['partial'] is True
+    with ZipFile(target / 'tables.zip') as z:
+        inventory = pd.read_csv(z.open('inventory.csv'))
+        assert pd.read_csv(z.open('scores.csv')).empty
+    omitted = inventory.loc[inventory.status == 'skipped_invalid_eeg'].iloc[0]
+    assert pd.isna(omitted.n_trials)
+    assert json.loads(omitted.validation_details)['invalid_cells_by_channel'] == {'Channel 2': 1}
+    cfg['input']['channels'] = ['Nonexistent channel']
+    cfg['paths']['output'] = str(tmp_path / 'bad_config')
+    with pytest.raises(ValueError, match='Seleção de canais'):
+        analyze_subject(table, cfg, skip_invalid_eeg=True)

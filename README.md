@@ -215,6 +215,23 @@ a tentativas. Essa opção é separada de `--skip-empty` e não omite outros err
 Blocos omitidos não entram no treino; ausência de IM1 ou de um online mantém as
 mesmas restrições do protocolo adaptativo.
 
+Erros de amostras agora distinguem EEG insuficiente (menos de três amostras),
+NaN, Inf, timestamps não finitos e timestamps não crescentes. O diagnóstico
+inclui caminho, contagens por canal e até dez índices de linhas de dados afetadas
+(base zero, não números físicos de linhas do CSV). Não são impressos valores EEG.
+Para uma execução parcial que também omita esses arquivos, acrescente
+`--skip-invalid-eeg`. O inventário registra `skipped_invalid_eeg`, hash, motivo e
+`validation_details`; o número de tentativas permanece desconhecido. Não há
+interpolação nem remoção pontual de amostras para fazer o arquivo passar.
+Erros de configuração, seleção de canais, eventos ou classificadores continuam
+fatais. Uma taxa incompatível/descontinuidade continua exigindo investigação;
+essa opção não é um capturador genérico de qualquer erro.
+
+As opções `--skip-empty`, `--skip-missing-attention` e `--skip-invalid-eeg`
+são independentes. Omissão de um IM posterior à sessão 1 impede o comparador
+congelado daquela sessão; o adaptativo continua usando apenas IM1 e online
+anteriores válidos, respeitando a regra de parada em lacunas online.
+
 Exemplo de EDA com os arquivos utilizáveis e janela fixa adequada às tarefas curtas:
 
 ```bash
