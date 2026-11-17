@@ -8,9 +8,11 @@ from io import BytesIO
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
 from matplotlib.backends.backend_pdf import PdfPages
 import mne
 import numpy as np
+from scipy.spatial import ConvexHull, Delaunay
 from eeg_processing import amplitude_unit
 
 
@@ -24,7 +26,11 @@ class Report:
     def __init__(self, output, subject, cfg):
         self.output, self.cfg = output, cfg
         self.pdf = PdfPages(output / "figures.pdf")
-        self.parts = [f"<h1>EDA de EEG — {escape(subject)}</h1>"]
+        title = "EDA e classificação de EEG" if cfg["classification"]["enabled"] else "EDA de EEG"
+        self.parts = [f"<h1>{title} — {escape(subject)}</h1>"]
+        if not cfg["classification"]["enabled"]:
+            self.text("SOMENTE EDA: classificadores não foram treinados. Acurácias, CV e testes online "
+                      "aparecem no relatório completo, executado sem --eda-only.")
         if cfg.get("_synthetic"):
             self.text("DEMONSTRAÇÃO COM DADOS SINTÉTICOS. Não contém resultados do sujeito EG102.")
         if cfg["input"]["eeg_unit"] == "native":
@@ -213,15 +219,17 @@ def timing_plot(trials, events):
 
 def spectral_plot(summary, block, cfg):
     roi = _roi(block, cfg)
-    fig, axes = plt.subplots(len(roi), 2, figsize=(10, 3*len(roi)), squeeze=False, sharex=True, sharey=True)
-    f = summary["f"]
+    fig, axes = plt.subplots(len(roi), 2, figsize=(10, 3*len(roi)), squeeze=False, sharex=True, sharey="row")
+    visible = ((summary["f"] >= cfg["spectral"]["display_hz"][0]) &
+               (summary["f"] <= cfg["spectral"]["display_hz"][1]))
+    f = summary["f"][visible]
     for row, (name, indices) in enumerate(roi):
         for col, label in enumerate(COLORS):
             ax = axes[row, col]
             mask = block.trials.label.to_numpy() == label
             if mask.any():
                 for phase, style, text in (("baseline", "--", "Atenção/baseline"), ("activity", "-", "Atividade")):
-                    values = summary[phase][mask][:, indices].mean(axis=1)
+                    values = summary[phase][mask][:, indices].mean(axis=1)[:, visible]
                     avg, low, high = _bootstrap(values, cfg)
                     db = lambda x: 10*np.log10(np.maximum(x, np.finfo(float).tiny))
                     ax.plot(f, db(avg), style, color=COLORS[label], label=text)
@@ -237,34 +245,73 @@ def spectral_plot(summary, block, cfg):
     return fig
 
 
+def _band_erd(summary, indices, lo, hi):
+    mask = (summary["tf_f"] >= lo) & (summary["tf_f"] < hi)
+    task = summary["tf_absolute"][:, indices][:, :, mask].sum(axis=2).mean(axis=1)
+    base = summary["tf_baseline"][:, indices][:, :, mask].sum(axis=2).mean(axis=1)
+    return 100*(task/base[:, None]-1)
+
+
 def tfr_plot(summary, block, cfg, relative=False):
+    """Cada mapa é seguido das curvas mu/beta do mesmo canal e da mesma classe."""
     roi = _roi(block, cfg)
-    fig, axes = plt.subplots(len(roi), 2, figsize=(10, 3*len(roi)), squeeze=False, sharex=True, sharey=True)
+    bands = list(cfg["spectral"]["bands"].items())
+    group = 1+len(bands)
+    fig, axes = plt.subplots(len(roi)*group, 2, figsize=(11, 5.5*len(roi)), squeeze=False,
+                             gridspec_kw={"height_ratios": ([2.5]+[1.2]*len(bands))*len(roi)})
     freq_mask = ((summary["tf_f"] >= cfg["spectral"]["display_hz"][0]) &
                  (summary["tf_f"] <= cfg["spectral"]["display_hz"][1]))
     source = summary["tf_erd"] if relative else 10*np.log10(np.maximum(summary["tf_absolute"], 1e-30))
-    if relative:
-        limits, cmap = (-100, 100), "RdBu_r"
-    else:
-        limits, cmap = np.nanpercentile(source[:, :, freq_mask], [5, 95]), "viridis"
+    tests = {(r["channel"], r["label"]): r for r in summary.get("tfr_tests", [])}
     for row, (name, indices) in enumerate(roi):
+        limits = (-100, 100) if relative else np.nanpercentile(source[:, indices][:, :, freq_mask], [5, 95])
+        if limits[0] == limits[1]:
+            limits = (limits[0]-1, limits[1]+1)
         for col, label in enumerate(COLORS):
-            ax = axes[row, col]
-            mask = block.trials.label.to_numpy() == label
-            if mask.any():
-                # Média de razões por tentativa para ERD; dB médio para espectrograma absoluto.
+            ax = axes[row*group, col]
+            selected = block.trials.label.to_numpy() == label
+            if selected.any():
                 import warnings
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", RuntimeWarning)
-                    z = np.nanmean(source[mask][:, indices].mean(axis=1), axis=0)[freq_mask]
+                    z = np.nanmean(source[selected][:, indices].mean(axis=1), axis=0)[freq_mask]
                 im = ax.pcolormesh(summary["tf_t"], summary["tf_f"][freq_mask], z,
-                                   shading="auto", cmap=cmap, vmin=limits[0], vmax=limits[1], rasterized=True)
-                fig.colorbar(im, ax=ax, label="ERD/ERS (%)" if relative else f"dB re 1 {amplitude_unit(cfg)}²/Hz",
-                             extend="both")
+                                   shading="auto", cmap="RdBu_r" if relative else "viridis",
+                                   vmin=limits[0], vmax=limits[1], rasterized=True)
+                channel = block.channels[indices[0]]
+                test = tests.get((channel, label), {}) if len(indices) == 1 else {}
+                if relative:
+                    if test.get("status") == "tested":
+                        significant = summary["tfr_masks"][(channel, label)]
+                        im.set_alpha(np.where(significant, 1., .18))
+                        note = "Clusters significativos em cor forte" if significant.any() else "Nenhum cluster significativo"
+                    else:
+                        note = "Significância não testada: " + test.get("status", "ROI agregada")
+                    ax.text(.01, .98, note, transform=ax.transAxes, va="top", fontsize=7,
+                            bbox=dict(facecolor="white", alpha=.8, edgecolor="none"))
+                fig.colorbar(im, cax=ax.inset_axes([1.02, 0, .025, 1]),
+                             label="ERD/ERS (%)" if relative else f"dB re 1 {amplitude_unit(cfg)}²/Hz", extend="both")
             ax.axvline(0, color="k", ls="--", lw=.8)
-            ax.set_title(f"{LABELS[label]} · {name} · n={mask.sum()}")
-            ax.set_xlabel("Tempo desde a cue (s)")
+            ax.set_title(f"{LABELS[label]} · {name} · n={selected.sum()}")
             ax.set_ylabel("Frequência (Hz)")
+            ax.set_xlabel("Tempo desde a cue (s)")
+            for offset, (band, (lo, hi)) in enumerate(bands, 1):
+                curve = axes[row*group+offset, col]
+                if selected.any():
+                    values = _band_erd(summary, indices, lo, hi)[selected]
+                    avg, low, high = _bootstrap(values, cfg)
+                    curve.plot(summary["tf_t"], avg, color=COLORS[label])
+                    curve.fill_between(summary["tf_t"], low, high, color=COLORS[label], alpha=.15)
+                    baseline = block.trials.loc[selected, ["baseline_start_s", "baseline_end_s"]].sub(
+                        block.trials.loc[selected, "cue_s"], axis=0).median()
+                    curve.axvspan(*baseline, color="gray", alpha=.12)
+                curve.axhline(0, color="gray", lw=.8)
+                curve.axvline(0, color="k", ls="--", lw=.8)
+                curve.set_xlim(summary["tf_t"][[0, -1]])
+                curve.set_title(f"{band} ({lo:g}–{hi:g} Hz) · {name}", fontsize=9)
+                curve.set_ylabel("ERD/ERS (%)")
+                curve.set_xlabel("Tempo desde a cue (s)")
+                curve.grid(alpha=.2)
     return fig
 
 
@@ -304,6 +351,10 @@ def topomap_plot(powers, block, cfg, relative=False):
         return None
     info = mne.create_info(block.channels, block.sfreq, ch_types="eeg")
     info.set_montage(montage, on_missing="raise")
+    # Mesma projeção 2D usada pelo MNE fixado em requirements.txt.
+    from mne.channels.layout import _find_topomap_coords
+    positions = _find_topomap_coords(info, np.arange(len(block.channels)))
+    hull = positions[ConvexHull(positions).vertices]
     bands = list(cfg["spectral"]["bands"])
     fig, axes = plt.subplots(len(bands), 2, figsize=(9, 3.7*len(bands)), squeeze=False)
     fig._is_topomap = True
@@ -327,9 +378,18 @@ def topomap_plot(powers, block, cfg, relative=False):
             values = means.loc[label].reindex(block.channels).to_numpy()
             if not relative:
                 values = 10*np.log10(values)
-            image, _ = mne.viz.plot_topomap(values, info, axes=ax, show=False,
+            image, _ = mne.viz.plot_topomap(values, positions, axes=ax, show=False,
                                             names=block.channels, vlim=vlim,
-                                            cmap="RdBu_r" if relative else "viridis", contours=0)
+                                            cmap="RdBu_r" if relative else "viridis", contours=0,
+                                            extrapolate="local", image_interp="linear")
+            # 'local' do MNE ainda adiciona margem: recortar no casco exato dos eletrodos.
+            image.set_clip_path(Polygon(hull, closed=True, transform=ax.transData))
+            xmin, xmax, ymin, ymax = image.get_extent()
+            pixels = image.get_array()
+            xx, yy = np.meshgrid(np.linspace(xmin, xmax, pixels.shape[1]),
+                                 np.linspace(ymin, ymax, pixels.shape[0]))
+            outside = Delaunay(hull).find_simplex(np.c_[xx.ravel(), yy.ravel()]) < 0
+            image.set_data(np.ma.masked_where(outside.reshape(pixels.shape), pixels))
             fig.colorbar(image, ax=ax, shrink=.65, label="ERD/ERS (%)" if relative else f"dB re 1 {amplitude_unit(cfg)}²")
             ax.set_title(f"{LABELS[label]} · {band}")
     if not cfg["figures"]["montage_confirmed"]:
@@ -365,29 +425,40 @@ def classification_figures(scores, predictions, report):
     if len(online):
         keys = sorted(set(zip(online.session, online.block)))
         lookup = {key: i for i, key in enumerate(keys)}
-        fig, ax = plt.subplots(figsize=(11, 4))
-        for experiment, color, label in (("session_im_frozen", "#777777", "IM da mesma sessão → online (congelado)"),
-                                         ("adaptive_protocol", "#0072B2", "IM1 + online anteriores → próximo bloco")):
-            rows = online.loc[online.experiment == experiment].sort_values(["session", "block"])
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4), sharey=True)
+        frozen = online.loc[online.experiment == "session_im_frozen"]
+        for name, rows in frozen.groupby("pipeline"):
+            rows = rows.sort_values(["session", "block"])
+            x = [lookup[(r.session, r.block)] for r in rows.itertuples()]
+            axes[0].plot(x, rows.accuracy*100, "o-", lw=.8, label=name)
+        chosen = "TGSP+SVM-"+report.cfg["classification"]["online_svm_kernel"]
+        interval = report.cfg["classification"].get("adaptive_update_blocks", 2)
+        for experiment, color, label in (("session_im_frozen", "#777777", "IM da mesma sessão (congelado)"),
+                                         ("adaptive_protocol", "#0072B2", f"IM1 + online (atualiza a cada {interval})")):
+            rows = online.loc[(online.experiment == experiment) & (online.pipeline == chosen)].sort_values(["session", "block"])
             if rows.empty:
                 continue
             x = [lookup[(r.session, r.block)] for r in rows.itertuples()]
-            ax.plot(x, rows.accuracy*100, "o-", color=color, label=label)
-            ax.fill_between(x, rows.accuracy_ci_low*100, rows.accuracy_ci_high*100, color=color, alpha=.12)
-        ax.set_xticks(range(len(keys)), [f"s{s}/{b[-1]}" for s, b in keys], rotation=45)
-        ax.set_ylim(0, 103)
-        ax.set_ylabel("Acurácia no bloco teste (%)")
-        ax.set_xlabel("Ordem cronológica dos blocos online")
-        ax.legend(fontsize=8)
+            axes[1].plot(x, rows.accuracy*100, "o-", color=color, label=label)
+            axes[1].fill_between(x, rows.accuracy_ci_low*100, rows.accuracy_ci_high*100, color=color, alpha=.12)
+        for ax in axes:
+            ax.set_xticks(range(len(keys)), [f"s{s}/{b[-1]}" for s, b in keys], rotation=45)
+            ax.set_ylim(0, 103)
+            ax.set_xlabel("Ordem cronológica dos blocos online")
+            ax.legend(fontsize=7)
+        axes[0].set_ylabel("Acurácia no bloco teste (%)")
+        axes[0].set_title("Seis pipelines: MI → online, sem atualização")
+        axes[1].set_title(chosen+f" · atualização a cada {interval} blocos")
         report.figure(fig, "Decodificação online e pseudo-coadaptação supervisionada",
-                      "Predição antes de incorporar os rótulos do bloco teste. Faixas: IC de Wilson de 95% "
+                      "Predição antes de incorporar os rótulos do lote de blocos teste. Faixas: IC de Wilson de 95% "
                       "descritivo entre tentativas, sem corrigir dependência temporal. Não são ICs entre sujeitos. "
                       "Não equivale a reproduzir decisões/feedback do modelo original em tempo real.")
     if not predictions.empty:
         from sklearn.metrics import confusion_matrix
         fig, axes = plt.subplots(1, 2, figsize=(8, 4))
         for ax, experiment in zip(axes, ("session_im_frozen", "adaptive_protocol")):
-            rows = predictions.loc[predictions.experiment == experiment]
+            rows = predictions.loc[(predictions.experiment == experiment) &
+                                   (predictions.pipeline == "TGSP+SVM-"+report.cfg["classification"]["online_svm_kernel"])]
             if rows.empty:
                 ax.set_visible(False)
                 continue
@@ -403,4 +474,4 @@ def classification_figures(scores, predictions, report):
             ax.set_xlabel("Predição")
             ax.set_ylabel("Classe real")
             ax.set_title(experiment)
-        report.figure(fig, "Matrizes de confusão dos testes online", "Contagens e proporções por classe verdadeira.")
+        report.figure(fig, "Matrizes de confusão dos testes online", "Contagens e proporções por classe verdadeira, apenas para o mesmo pipeline TGSP+SVM nos dois protocolos.")

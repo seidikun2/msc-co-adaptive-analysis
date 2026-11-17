@@ -18,6 +18,10 @@ import yaml
 AUXILIARY_CSVS = {"organizacao_experimentos.csv", "motor_16ch.csv"}
 
 
+class EmptyRecordingError(ValueError):
+    """CSV sem cabeçalho; só pode ser omitido mediante opção explícita."""
+
+
 def is_auxiliary_csv(path):
     return Path(path).name.casefold() in AUXILIARY_CSVS
 
@@ -67,7 +71,7 @@ def read_frame(path, cfg):
         try:
             return pd.read_csv(path, sep=sep, encoding="utf-8-sig", **kwargs)
         except pd.errors.EmptyDataError as exc:
-            raise ValueError(f"CSV vazio ou sem cabeçalho legível: {path}. "
+            raise EmptyRecordingError(f"CSV vazio ou sem cabeçalho legível: {path}. "
                              "Confira o arquivo original/exportação; nenhuma gravação foi ignorada.") from exc
         except pd.errors.ParserError as exc:
             raise ValueError(f"CSV inválido: {path}: {exc}") from exc
@@ -77,6 +81,8 @@ def read_frame(path, cfg):
     event_cols += [options[k] for k in ("event_id_column", "event_date_column",
                                       "event_duration_column") if options.get(k)]
     frame = read_csv(decimal=options["decimal"], dtype={c: str for c in event_cols})
+    if frame.empty:
+        raise EmptyRecordingError(f"CSV sem amostras (apenas cabeçalho): {path}")
     frame.columns = [str(c).strip() for c in frame.columns]
     return frame
 

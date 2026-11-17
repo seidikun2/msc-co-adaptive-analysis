@@ -64,7 +64,7 @@ spectral:
   tfr_step_s: 0.1
   tfr_range_s: [-2.0, 4.5] # relativo à cue, inclusive se anchor = task_start
   display_hz: [3.0, 40.0]
-  channels_of_interest: [C3, C4]
+  channels_of_interest: [C3, Cz, C4]
 
 classification:
   enabled: true
@@ -75,6 +75,7 @@ classification:
   csp_components: 4
   svm_C: 1.0
   online_svm_kernel: rbf  # linear ou rbf; hiperparâmetros fixos, sem seleção no teste
+  adaptive_update_blocks: 2 # mesmo modelo para a/b; incorpora o par antes de c/d
   seed: 42
   allow_protocol_gaps: false # protocolo para na primeira lacuna; não inventa atualizações
 
@@ -86,3 +87,7 @@ figures:
   montage_confirmed: false # true SOMENTE após substituir/verificar a lista acima
   dpi: 150
   bootstrap_samples: 500
+  tfr_significance: true # teste exploratório por clusters (tempo × frequência)
+  tfr_permutations: 512
+  tfr_min_trials: 8
+  tfr_alpha: 0.05 # correção adicional entre canais × classes do mesmo bloco

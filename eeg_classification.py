@@ -111,9 +111,9 @@ def cross_validate(block, cfg):
     return scores, predictions
 
 
-def _transfer(train_blocks, test, experiment, cfg):
-    classifier = "SVM-"+cfg["classification"]["online_svm_kernel"]
-    name = "TGSP+"+classifier
+def _transfer(train_blocks, test, experiment, cfg, feature="TGSP", classifier=None, models=None):
+    classifier = classifier or "SVM-"+cfg["classification"]["online_svm_kernel"]
+    name = feature+"+"+classifier
     usable = [b for b in train_blocks if len(b.X)]
     if not usable or not len(test.X):
         return _skip(test, experiment, name, "no_accepted_train_or_test_trials"), None
@@ -121,12 +121,18 @@ def _transfer(train_blocks, test, experiment, cfg):
     y = np.concatenate([b.trials.label.to_numpy() for b in usable])
     if len(np.unique(y)) < 2:
         return _skip(test, experiment, name, "training_has_one_class"), None
+    if classifier == "LDA" and pd.Series(y).value_counts().min() < 2:
+        return _skip(test, experiment, name, "fewer_than_two_training_trials_per_class"), None
     # Auditável: nenhuma tentativa do bloco teste pode entrar no treino.
     train_ids = set().union(*(set(b.trials.trial_id) for b in usable))
     if train_ids & set(test.trials.trial_id):
         raise ValueError("Vazamento: tentativa aparece simultaneamente no treino e teste.")
-    model = make_model("TGSP", classifier, len(test.channels), cfg)
-    model.fit(X, y)
+    model = models.get(name) if models is not None else None
+    if model is None:
+        model = make_model(feature, classifier, len(test.channels), cfg)
+        model.fit(X, y)
+        if models is not None:
+            models[name] = model
     pred = model.predict(test.X)
     score = _score_row(test, experiment, name, test.trials.label.to_numpy(), pred,
                        len(y), ";".join(_block_name(b) for b in usable))
@@ -151,20 +157,28 @@ def classify_subject(blocks, cfg):
     online = sorted([b for b in blocks if b.meta["block"].startswith("online_")],
                     key=lambda b: (b.meta["session"], b.meta["block"]))
     name = "TGSP+SVM-"+cfg["classification"]["online_svm_kernel"]
+    frozen_models = {}
     for test in online:
         im = by_key.get((test.meta["session"], "im"))
         if im is None:
-            scores.append(_skip(test, "session_im_frozen", name, "missing_same_session_im"))
+            for feature in ("TGSP", "CSP"):
+                for classifier in ("LDA", "SVM-linear", "SVM-rbf"):
+                    scores.append(_skip(test, "session_im_frozen", feature+"+"+classifier, "missing_same_session_im"))
         else:
-            score, pred = _transfer([im], test, "session_im_frozen", cfg)
-            scores.append(score)
-            if pred is not None:
-                predictions.append(pred)
+            models = frozen_models.setdefault(test.meta["session"], {})
+            for feature in ("TGSP", "CSP"):
+                for classifier in ("LDA", "SVM-linear", "SVM-rbf"):
+                    score, pred = _transfer([im], test, "session_im_frozen", cfg, feature, classifier, models)
+                    scores.append(score)
+                    if pred is not None:
+                        predictions.append(pred)
     initial = by_key.get((1, "im"))
     if initial is None:
         scores.extend(_skip(b, "adaptive_protocol", name, "missing_session_1_im") for b in online)
     else:
         history = [initial]
+        pending, models = [], {}
+        interval = cfg["classification"].get("adaptive_update_blocks", 2)
         expected = [(s, f"online_{letter}") for s in range(1, 7) for letter in "abcd"]
         last = max((expected.index((b.meta["session"], b.meta["block"])) for b in online), default=-1)
         gap = ""
@@ -177,11 +191,15 @@ def classify_subject(blocks, cfg):
             if gap:
                 scores.append(_skip(test, "adaptive_protocol", name, gap))
                 continue
-            score, pred = _transfer(history, test, "adaptive_protocol", cfg)
+            score, pred = _transfer(history, test, "adaptive_protocol", cfg, models=models)
             score["partial_sequence"] = cfg["classification"]["allow_protocol_gaps"]
             scores.append(score)
             if pred is not None:
                 predictions.append(pred)
             # Atualização supervisionada cumulativa; nunca inclui im de sessões 2–6.
-            history.append(test)
+            pending.append(test)
+            if len(pending) == interval:
+                history.extend(pending)
+                pending.clear()
+                models.clear()  # próximo bloco refaz o treino; o par anterior usou o mesmo modelo
     return pd.DataFrame(scores), pd.concat(predictions, ignore_index=True) if predictions else pd.DataFrame()

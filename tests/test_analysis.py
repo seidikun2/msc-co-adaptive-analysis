@@ -259,11 +259,12 @@ def test_adaptive_protocol_excludes_im2_and_current_online_test(cfg, monkeypatch
     adaptive = scores.loc[(scores.experiment == "adaptive_protocol") & (scores.session == 2)]
     assert adaptive.iloc[0].train_blocks == "s01/im;s01/online_a;s01/online_b;s01/online_c;s01/online_d"
     assert adaptive.iloc[0].n_train == 20
-    assert "s02/online_a" in adaptive.iloc[1].train_blocks
+    assert adaptive.iloc[1].train_blocks == adaptive.iloc[0].train_blocks
     assert not adaptive.train_blocks.str.contains("s02/im").any()
     frozen = scores.loc[(scores.experiment == "session_im_frozen") & (scores.session == 2)]
     assert set(frozen.train_blocks) == {"s02/im"}
     assert len(predictions.loc[predictions.experiment == "adaptive_protocol"]) == 24
+    assert frozen.pipeline.nunique() == 6
 
 
 def test_protocol_does_not_jump_missing_blocks(cfg, monkeypatch):
@@ -403,6 +404,7 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
     for name in ('Organizacao_experimentos.csv', 'motor_16ch.csv'):
         (data / name).write_text('configuration,not EEG\n1,2\n')
     (data / 'motor_me_EMPTY_1.csv').write_text('')
+    (data / 'SYNTHETIC' / 'motor_me_SYNTHETIC_3.csv').write_text('')
     environment = dict(os.environ, MPLBACKEND='Agg',
                        MPLCONFIGDIR=str(tmp_path / 'mpl'),
                        OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1')
@@ -413,7 +415,8 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
             [sys.executable, str(project / 'run_analysis.py'),
              'inspect' if command == 'inspect' else 'run',
              '--config', str(synthetic / 'config.yaml'), '--data', str(data),
-             '--output', str(output), '--exclude', 'motor_me_EMPTY_1.csv', *extra],
+             '--output', str(output), '--exclude', 'motor_me_EMPTY_1.csv',
+             *(['--exclude', 'SYNTHETIC/motor_me_SYNTHETIC_3.csv'] if command == 'inspect' else ['--skip-empty']), *extra],
             cwd=project, env=environment, capture_output=True, text=True, timeout=180)
         assert result.returncode == 0, result.stdout + result.stderr
         if command == 'inspect':
@@ -422,10 +425,13 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
             assert inventory.error.isna().all()
         else:
             folder = output / 'SYNTHETIC'
+            provenance = json.loads((folder / 'run-info.json').read_text())
+            assert provenance['partial'] is True
             assert (folder / 'report.html').stat().st_size > 0
             assert (folder / 'figures.pdf').read_bytes().startswith(b'%PDF')
             with ZipFile(folder / 'tables.zip') as archive:
                 inventory = pd.read_csv(archive.open('inventory.csv'))
+                assert inventory.loc[inventory.status == 'skipped_empty', 'block'].tolist() == ['me']
                 trials = pd.read_csv(archive.open('trials.csv'))
                 scores = pd.read_csv(archive.open('scores.csv'))
                 powers = pd.read_csv(archive.open('bandpower.csv'))
@@ -579,3 +585,162 @@ def test_artifact_after_classifier_window_does_not_reject_classifier(cfg):
     assert len(block.X) == 2
     assert block.eda_trials.empty
     assert set(trials.eda_reason) == {'high_peak_to_peak'}
+
+
+def test_adaptive_reuses_model_for_pairs_and_refits_after_both_labels(cfg, monkeypatch):
+    fits = []
+    monkeypatch.setattr(classification, 'make_model', spy_factory(fits))
+    monkeypatch.setattr(classification, 'cross_validate', lambda *args: ([], []))
+    blocks = [toy_block(1, 'im', 100)]
+    blocks += [toy_block(1, 'online_'+letter, 110+10*i) for i, letter in enumerate('abcd')]
+    scores, _ = classification.classify_subject(blocks, cfg)
+    adaptive = scores.loc[scores.experiment == 'adaptive_protocol']
+    assert adaptive.train_blocks.tolist() == ['s01/im', 's01/im',
+        's01/im;s01/online_a;s01/online_b', 's01/im;s01/online_a;s01/online_b']
+    assert len(fits) == 8  # six frozen fits, two adaptive fits; no refit between a/b or c/d
+    assert fits[-2] == set(range(100, 104))
+    assert fits[-1] == set(range(100, 104)) | set(range(110, 114)) | set(range(120, 124))
+
+
+def test_psd_limits_ignore_out_of_view_dc_and_stopband(cfg):
+    import matplotlib.pyplot as plt
+    from eeg_figures import spectral_plot
+    block = toy_block(1, 'im', 100)
+    f = np.arange(65.)
+    values = np.ones((4, 4, len(f)))
+    values[:, :, 0] = 1e40
+    values[:, :, -1] = 1e-100
+    fig = spectral_plot(dict(f=f, baseline=values, activity=values), block, cfg)
+    assert len(fig.axes) == 6  # C3, Cz, C4 × two classes
+    for ax in fig.axes:
+        assert ax.get_ylim()[0] > -10 and ax.get_ylim()[1] < 10
+        for line in ax.lines:
+            assert min(line.get_xdata()) >= 3 and max(line.get_xdata()) <= 40
+    plt.close(fig)
+
+
+def test_topomap_masks_every_pixel_outside_electrode_hull(cfg):
+    import matplotlib.pyplot as plt
+    from mne.channels.layout import _find_topomap_coords
+    import mne
+    from scipy.spatial import Delaunay
+    from eeg_figures import topomap_plot
+    rec = recording(cfg)
+    block, _, _, filtered, _ = prepare_block(rec, cfg, dict(subject='SYNTHETIC', group='demo', session=1, block='im'))
+    _, powers = spectral_summary(rec, filtered, block, cfg)
+    fig = topomap_plot(powers, block, cfg)
+    info = mne.create_info(block.channels, block.sfreq, 'eeg')
+    info.set_montage(mne.channels.make_standard_montage(cfg['figures']['montage']))
+    pos = _find_topomap_coords(info, np.arange(len(block.channels)))
+    for ax in fig.axes:
+        for image in ax.images:
+            data = image.get_array()
+            x0, x1, y0, y1 = image.get_extent()
+            xx, yy = np.meshgrid(np.linspace(x0, x1, data.shape[1]), np.linspace(y0, y1, data.shape[0]))
+            outside = Delaunay(pos).find_simplex(np.c_[xx.ravel(), yy.ravel()]) < 0
+            assert np.ma.getmaskarray(data).ravel()[outside].all()
+            assert data.count() > 0
+    plt.close(fig)
+
+
+def test_tfr_clusters_are_reproducible_corrected_and_exclude_missing_bins(cfg):
+    from eeg_processing import tfr_significance
+    cfg['figures']['tfr_permutations'] = 128
+    rng = np.random.default_rng(12)
+    block = toy_block(1, 'im', 100)
+    block.trials = pd.DataFrame({'label': ['left']*12+['right']*12})
+    log_ratio = rng.normal(0, .5, (24, 4, 3, 5))
+    log_ratio[:, :, 1:, 1:4] -= 4
+    absolute = 10**(log_ratio/10)
+    absolute[:, :, :, -1] = np.nan
+    summary = dict(tf_absolute=absolute, tf_baseline=np.ones((24, 4, 3)),
+                   tf_f=np.array([8., 10., 12.]), tf_t=np.array([-1., 0., .5, 1., 1.5]))
+    first = tfr_significance(summary, block, cfg)
+    second = tfr_significance(summary, block, cfg)
+    assert first['tfr_tests'] == second['tfr_tests']
+    assert len(first['tfr_tests']) == 6
+    for record in first['tfr_tests']:
+        assert record['status'] == 'tested' and record['family_panels'] == 6
+        assert any(p <= .05 for p in record['p_corrected'])
+    for key, mask in first['tfr_masks'].items():
+        np.testing.assert_array_equal(mask, second['tfr_masks'][key])
+        assert not mask[:, 0].any() and not mask[:, -1].any()
+        assert mask[1:, 1:4].any()
+    cfg['figures']['tfr_min_trials'] = 20
+    skipped = tfr_significance(summary, block, cfg)
+    assert {r['status'] for r in skipped['tfr_tests']} == {'insufficient_trials'}
+    assert not any(m.any() for m in skipped['tfr_masks'].values())
+
+
+@pytest.mark.parametrize('content', ['', 'Time:128Hz,Channel 1\n'])
+def test_skip_empty_reports_all_empty_subject_without_inventing_results(tmp_path, cfg, content):
+    import json
+    from zipfile import ZipFile
+    from eeg_io import EmptyRecordingError
+    from run_analysis import analyze_subject
+    path = tmp_path / 'motor_me_TEST_1.csv'
+    path.write_text(content)
+    cfg['paths'].update(data=str(tmp_path), output=str(tmp_path / 'results'), manifest=None)
+    table = discover(cfg)
+    with pytest.raises(EmptyRecordingError):
+        analyze_subject(table, cfg)
+    assert not (tmp_path / 'results' / 'TEST').exists()
+    analyze_subject(table, cfg, skip_empty=True)
+    target = tmp_path / 'results' / 'TEST'
+    assert json.loads((target / 'run-info.json').read_text())['partial'] is True
+    assert 'EXECUÇÃO PARCIAL' in (target / 'report.html').read_text()
+    with ZipFile(target / 'tables.zip') as z:
+        tables = {name: pd.read_csv(z.open(name)) for name in z.namelist()}
+    inventory = tables['inventory.csv']
+    assert inventory.loc[inventory.status == 'skipped_empty', 'path'].tolist() == [str(path)]
+    assert tables['trials.csv'].empty and tables['scores.csv'].empty
+
+
+def test_skip_empty_does_not_hide_nonempty_invalid_recording(tmp_path, cfg):
+    from run_analysis import analyze_subject
+    (tmp_path / 'motor_me_TEST_1.csv').write_text('invalid,header\n1,2\n')
+    cfg['paths'].update(data=str(tmp_path), output=str(tmp_path / 'results'), manifest=None)
+    with pytest.raises(ValueError, match='Coluna não encontrada'):
+        analyze_subject(discover(cfg), cfg, skip_empty=True)
+    assert not (tmp_path / 'results' / 'TEST').exists()
+
+
+def test_symmetric_tfr_null_is_not_marked_significant(cfg):
+    import warnings
+    from eeg_processing import tfr_significance
+    block = toy_block(1, 'im', 100)
+    block.trials = pd.DataFrame({'label': ['left']*12+['right']*12})
+    rng = np.random.default_rng(22)
+    half = rng.normal(size=(6, 4, 3, 4))
+    values = np.concatenate([half, -half, half, -half])
+    summary = dict(tf_absolute=10**(values/10), tf_baseline=np.ones((24, 4, 3)),
+                   tf_f=np.array([8., 10., 12.]), tf_t=np.array([-1., 0., .5, 1.]))
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='No clusters found')
+        result = tfr_significance(summary, block, cfg)
+    assert {r['status'] for r in result['tfr_tests']} == {'tested'}
+    assert all(r['n_significant_bins'] == 0 for r in result['tfr_tests'])
+
+
+def test_tfr_curves_are_aligned_below_each_map_and_include_cz(cfg):
+    import matplotlib.pyplot as plt
+    from eeg_figures import tfr_plot
+    block = toy_block(1, 'im', 100)
+    block.trials['baseline_start_s'] = 0.
+    block.trials['baseline_end_s'] = 1.
+    block.trials['cue_s'] = 2.
+    summary = dict(tf_absolute=np.ones((4, 4, 6, 4)), tf_baseline=np.ones((4, 4, 6)),
+                   tf_erd=np.zeros((4, 4, 6, 4)), tf_f=np.array([8., 10., 12., 13., 20., 29.]),
+                   tf_t=np.array([-1., 0., 1., 2.]))
+    fig = tfr_plot(summary, block, cfg, relative=True)
+    fig.tight_layout()
+    assert len(fig.axes) == 18  # 3 channels × 2 classes × (map + mu + beta)
+    assert any('Cz' in ax.get_title() for ax in fig.axes)
+    for offset in range(0, 18, 6):
+        for col in (0, 1):
+            map_ax = fig.axes[offset+col]
+            for curve in (fig.axes[offset+2+col], fig.axes[offset+4+col]):
+                assert curve.get_position().y1 < map_ax.get_position().y0
+                assert abs(curve.get_position().x0-map_ax.get_position().x0) < .001
+                assert abs(curve.get_position().x1-map_ax.get_position().x1) < .001
+    plt.close(fig)

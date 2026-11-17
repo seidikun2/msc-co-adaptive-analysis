@@ -195,6 +195,19 @@ nenhuma tentativa online é aceita. Não substitui marcadores nem encurta as jan
 para aceitar dados. Um erro de CSV vazio inclui o caminho completo e interrompe
 a análise, sem publicar relatório parcial como concluído.
 
+Para continuar explicitamente apesar de CSVs vazios, use `run --skip-empty`.
+Só CSVs sem cabeçalho ou sem amostras são omitidos; outros erros continuam fatais.
+Cada omissão aparece no terminal/HTML e no inventário com `status=skipped_empty`,
+caminho, hash e motivo. `run-info.json` marca `partial: true`. Isso não recupera
+os dados: reexporte os arquivos para uma análise completa. IM1 vazio impede o
+protocolo adaptativo; um online vazio preserva a regra de parada na primeira lacuna.
+
+Exemplo de EDA com os arquivos utilizáveis e janela fixa adequada às tarefas curtas:
+
+```bash
+python run_analysis.py run --data "/home/seidi/Área de trabalho/Dados Seidi" --eda-only --activity-window 0.5 3.5 --skip-empty --output results/eda-revisado
+```
+
 Para examinar todos os blocos mesmo se houver arquivos inválidos, sem gerar
 figuras ou treinar classificadores:
 
@@ -259,8 +272,38 @@ O caminho de leitura do código é `eeg_io.py` → `eeg_processing.py` →
   de atenção. `events.csv` preserva tempos relativos à atenção, à cue e ao início motor.
 - PSD por classe e canal de interesse, comparando atenção e atividade; espectrogramas
   absolutos e relativos à baseline; curvas ERD/ERS de mu (8–13 Hz) e beta (13–30 Hz).
+  C3, Cz e C4 são exibidos por padrão, ainda com nomes provisórios. A escala PSD
+  usa só as frequências visíveis e é compartilhada entre classes de cada canal,
+  evitando que DC e frequências fora da faixa achatem as curvas.
+  Cada espectrograma vem seguido das curvas mu e beta do mesmo canal/classe,
+  com eixos temporais alinhados e ICs bootstrap descritivos entre tentativas.
 - Topografia da potência e do ERD no **escalpo**. Isso não é uma reconstrução de
   fontes corticais; posições artificiais não sustentam conclusões anatômicas.
+  A interpolação é linear e recortada no casco convexo exato dos eletrodos
+  projetados: nenhuma cor é mostrada fora da região amostrada.
+
+Nos mapas ERD/ERS, cor forte destaca clusters pós-cue significativos; áreas
+não significativas ficam atenuadas sem alterar os valores exportados. Inspirado
+no [exemplo oficial do MNE](https://mne.tools/stable/auto_examples/time_frequency/time_frequency_erds.html),
+o teste usa permutações de sinal por **tentativa**, bilateralmente, na diferença
+de log-potência para sua baseline. Clusters agrupam bins adjacentes em tempo e
+frequência, com limiar inicial t bilateral de 5% e máximo de massa por permutação.
+Os p de cluster recebem ainda Bonferroni entre canais × classes do mesmo bloco.
+Não há correção conjunta entre diferentes blocos ou sujeitos.
+
+Padrões em `figures`: `tfr_significance: true`, `tfr_permutations: 512`,
+`tfr_min_trials: 8` por classe e `tfr_alpha: 0.05`. Só bins pós-cue finitos em todas
+as tentativas daquele painel são testados; bordas faltantes e variância zero são
+excluídas. Dados insuficientes/desabilitação são indicados como **não testados**.
+Método, número de tentativas, permutações efetivas e p corrigidos ficam em
+`run-info.json`; parâmetros e semente ficam em `config-used.yaml`.
+
+É uma análise exploratória dentro do sujeito, dependente da hipótese de simetria
+sob troca de sinais e da permutabilidade das tentativas. Dependência temporal
+entre tentativas pode violar essa hipótese. A máscara não demonstra diferenças
+entre classes/grupos, não identifica precisamente início/frequência do efeito e
+não equivale a provar ausência de efeito onde não há significância. Os ICs das
+curvas continuam descritivos, não são a máscara inferencial.
 
 Referência visual com **dados sintéticos**, também disponível em `marker_reference.png`:
 
@@ -339,19 +382,24 @@ Uma futura busca deve usar CV **aninhada** apenas no treino.
    predições fora do fold (OOF), sem duplicar as tentativas ao combinar folds.
    A CV estratificada não mede extrapolação temporal e pode ser otimista sob
    deriva; `cv_scheme: forward` ativa TimeSeriesSplit e registra sua cobertura.
-2. **`session_im_frozen`**: TGSP+SVM treinado no `im` da mesma sessão, avaliado
-   separadamente em a, b, c, d sem atualização. É comparador diagnóstico;
+2. **`session_im_frozen`**: os seis pipelines treinados no `im` da mesma sessão,
+   avaliados separadamente em a, b, c, d sem atualização. É comparador diagnóstico;
    usar `im2` aqui NÃO altera o protocolo adaptativo abaixo.
-3. **`adaptive_protocol`**: inicializa **somente com IM da sessão 1**. Prediz 1a,
-   depois incorpora seus rótulos verdadeiros; prediz 1b, incorpora 1b; segue até
-   1d, 2a, …, 6d. Cada passo refaz o pipeline cumulativamente com todos os blocos
-   passados. **IM2–IM6 nunca entram no treino desse experimento.**
+3. **`adaptive_protocol`**: TGSP+SVM inicializa **somente com IM da sessão 1**.
+   O mesmo modelo prediz 1a e 1b, sem usar rótulos de nenhum deles no par.
+   Depois incorpora ambos e refaz cumulativamente o treino antes de 1c/1d;
+   incorpora c/d antes de 2a/2b e assim por diante até 6d.
+   `adaptive_update_blocks: 2` controla a cadência (1 reproduz a atualização antiga
+   por bloco). **IM2–IM6 nunca entram no treino desse experimento.**
 
 A SVM online padrão é RBF, configurável para linear. O teste ocorre antes da
 atualização; não há auto-rotulação nem teste usando treino do próprio bloco.
 Acurácia, acurácia balanceada, kappa, IC de Wilson da acurácia e predições por
 tentativa são exportados. Os ICs binomiais são descritivos e não corrigem
 dependência temporal. O campo `train_blocks` permite auditar cada treino.
+As matrizes de confusão comparam o mesmo TGSP+SVM entre os protocolos, sem somar
+predições de classificadores diferentes. `--eda-only` não calcula essas métricas;
+o relatório sinaliza isso no início. Para acurácias e comparações, remova a opção.
 
 Ausência de IM1 impede reproduzir o protocolo. Uma lacuna na sequência online
 interrompe suas avaliações seguintes, preservando avaliações anteriores. Só

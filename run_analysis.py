@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from eeg_io import BLOCKS, discover, inspect_folder, load_config, read_recording
+from eeg_io import BLOCKS, EmptyRecordingError, discover, inspect_folder, load_config, read_recording
 from eeg_processing import event_table, prepare_block, spectral_summary, validate_config
 from eeg_classification import classify_subject
 
@@ -71,8 +71,7 @@ def diagnose(table, cfg, destination, overwrite=False):
 
 
 def _draw_block(report, rec, raw, filtered, block, trials, events, summary, powers, cfg):
-    from eeg_figures import (raw_plot, timing_plot, spectral_plot, tfr_plot,
-                             erd_curve_plot, topomap_plot)
+    from eeg_figures import raw_plot, timing_plot, spectral_plot, tfr_plot, topomap_plot
     title = f"Sessão {block.meta['session']} · {block.meta['block']}"
     report.text(f"{title}: classificação {len(block.X)}/{len(trials)}; "
                 f"EDA {len(block.trials)}/{len(trials)} tentativas aceitas. "
@@ -96,17 +95,23 @@ def _draw_block(report, rec, raw, filtered, block, trials, events, summary, powe
         return
     report.figure(spectral_plot(summary, block, cfg), title+" · Espectro por classe",
                   "Welch por tentativa; média em potência linear antes de converter para dB. "
-                  "Faixas: bootstrap de 95% entre tentativas, descritivo dentro deste sujeito.")
+                  "Faixas: bootstrap de 95% entre tentativas, descritivo dentro deste sujeito. "
+                  "Escala vertical ajustada apenas às frequências visíveis; compartilhada entre classes por canal.")
     report.figure(tfr_plot(summary, block, cfg), title+" · Espectrograma por classe",
                   "PSD tempo–frequência; média de dB entre tentativas. Eixo temporal relativo à cue. "
-                  "Cores compartilhadas entre classes/canais; bordas sem dados ficam vazias.")
+                  "Cores compartilhadas entre classes de cada canal; bordas sem dados ficam vazias. "
+                  "Logo abaixo de cada mapa: curvas mu/beta do mesmo canal/classe, com bootstrap descritivo de 95%.")
     report.figure(tfr_plot(summary, block, cfg, relative=True), title+" · ERD/ERS tempo–frequência",
                   "100 × [P(t,f)/P_baseline(f) − 1], calculado em cada tentativa ANTES da média. "
                   "A baseline vem da atenção dessa tentativa. Negativo = ERD; positivo = ERS. "
-                  "Saturação visual em ±100%; os valores das tabelas não são truncados.")
-    report.figure(erd_curve_plot(summary, block, cfg), title+" · ERD/ERS nas bandas motoras",
-                  "Potência integrada na banda antes da razão por baseline. Área cinza: intervalo mediano "
-                  "da baseline; linha vertical: cue. Faixas: bootstrap de 95% entre tentativas.")
+                  "Saturação visual em ±100%; os valores das tabelas não são truncados. "
+                  "Cor forte: clusters bilaterais de log-potência/baseline pós-cue, com correção por "
+                  "tempo/frequência e Bonferroni entre canais × classes deste bloco. "
+                  "Teste exploratório entre tentativas, sujeito à hipótese de simetria/troca de sinais; "
+                  "não é inferência de grupo nem localiza precisamente início/frequência do efeito. "
+                  "Teste não aplicado é indicado, não interpretado como ausência de efeito. "
+                  "Curvas mu/beta abaixo de cada mapa integram potência antes da razão; ICs são descritivos. "
+                  "Método, contagens e p corrigidos ficam em run-info.json.")
     for relative in (False, True):
         fig = topomap_plot(powers, block, cfg, relative)
         if fig is None:
@@ -115,10 +120,11 @@ def _draw_block(report, rec, raw, filtered, block, trials, events, summary, powe
         report.figure(fig, title+(" · Mapa de ERD/ERS" if relative else " · Mapa de potência espectral"),
                       "Topografia do ESCALPO, não localização de fontes corticais. Escalas compartilhadas "
                       "entre classes dentro de cada banda. Potência: média linear → dB. ERD: média das "
-                      "razões por tentativa. Posições artificiais não permitem interpretação anatômica.")
+                      "razões por tentativa. Interpolação limitada ao casco convexo dos eletrodos, sem cores fora dele. "
+                      "Posições artificiais não permitem interpretação anatômica.")
 
 
-def analyze_subject(table, cfg, overwrite=False):
+def analyze_subject(table, cfg, overwrite=False, skip_empty=False):
     from eeg_figures import Report, classification_figures
     subject = str(table.subject.iloc[0])
     root = Path(cfg["paths"]["output"])
@@ -129,6 +135,7 @@ def analyze_subject(table, cfg, overwrite=False):
     work = Path(tempfile.mkdtemp(prefix=f".{subject}-", dir=root))
     report = Report(work, subject, cfg)
     blocks, all_trials, all_events, all_qc, all_power, inventory, selected = [], [], [], [], [], [], set()
+    tfr_tests = []
     try:
         report.text("As tabelas completas estão em tables.zip. Há seis sessões esperadas, cada uma com "
                     "me, im e online a–d. Ausências são registradas, sem inventar gravações. "
@@ -141,7 +148,19 @@ def analyze_subject(table, cfg, overwrite=False):
         for row in table.itertuples():
             meta = dict(subject=subject, group=row.group, session=int(row.session), block=row.block)
             print(f"{subject} · sessão {row.session} · {row.block}: lendo {Path(row.path).name}", flush=True)
-            rec = read_recording(row.path, cfg)
+            try:
+                rec = read_recording(row.path, cfg)
+            except EmptyRecordingError as exc:
+                if not skip_empty:
+                    raise
+                message = f"EXECUÇÃO PARCIAL — arquivo vazio omitido: {row.path}: {exc}"
+                print(message, flush=True)
+                report.text(message)
+                inventory.append(dict(**meta, path=row.path, sha256=_sha256(row.path),
+                                      status="skipped_empty", error=str(exc), n_trials=0,
+                                      n_accepted=0, n_eda_accepted=0, duplicate_paths=row.duplicate_paths,
+                                      duplicate_entries=row.duplicate_entries, duplicate_sha256=row.duplicate_sha256))
+                continue
             block, trials, raw, filtered, qc = prepare_block(rec, cfg, meta)
             print(f"  Classificação: {len(block.X)}/{len(trials)}; "
                   f"EDA: {len(block.eda_trials)}/{len(trials)} tentativas aceitas", flush=True)
@@ -156,6 +175,8 @@ def analyze_subject(table, cfg, overwrite=False):
             selected.add(kind)
             eda_block = replace(block, trials=block.eda_trials)
             summary, powers = spectral_summary(rec, filtered, eda_block, cfg, with_tfr=draw)
+            if summary is not None and draw:
+                tfr_tests.extend(dict(**meta, **result) for result in summary.get("tfr_tests", []))
             events = event_table(rec, cfg, meta, trials)
             qc["position_confirmed"] = cfg["figures"]["montage_confirmed"]
             original = cfg["input"].get("channels") or rec.channels
@@ -175,6 +196,9 @@ def analyze_subject(table, cfg, overwrite=False):
             if draw:
                 _draw_block(report, rec, raw, filtered, eda_block, trials, events, summary, powers, cfg)
             blocks.append(block)
+        if any(r["status"] == "skipped_empty" for r in inventory):
+            report.parts.insert(1, "<p><strong>EXECUÇÃO PARCIAL: há CSVs vazios omitidos. "
+                                "Confira os caminhos e motivos no inventário.</strong></p>")
         present = {(r["session"], r["block"]) for r in inventory}
         missing = [dict(subject=subject, group=table.group.iloc[0], session=s, block=b, status="missing")
                    for s in range(1, 7) for b in BLOCKS if (s, b) not in present]
@@ -183,7 +207,10 @@ def analyze_subject(table, cfg, overwrite=False):
         print(f"{subject}: comparando classificadores…", flush=True)
         from threadpoolctl import threadpool_limits
         with threadpool_limits(limits=cfg["classification"].get("blas_threads", 1)):
-            scores, predictions = classify_subject(blocks, cfg)
+            scores, predictions = classify_subject(blocks, cfg) if blocks else (pd.DataFrame(), pd.DataFrame())
+        if not blocks:
+            report.text("Nenhuma gravação utilizável neste sujeito; todos os arquivos foram omitidos como vazios. "
+                        "Não há medidas EDA nem resultados de classificação.")
         report.text("CV offline: "+cfg["classification"]["cv_scheme"]+". TGSP = covariância Ledoit–Wolf → "
                     "espaço tangente riemanniano; CSP usa as mesmas covariâncias regularizadas. "
                     "Ambos usam escala aprendida no treino e LDA com shrinkage ou SVM de parâmetros fixos. "
@@ -191,9 +218,10 @@ def analyze_subject(table, cfg, overwrite=False):
                     "use cv_scheme=forward como sensibilidade. Não há seleção de hiperparâmetros no teste.")
         report.text("session_im_frozen: IM da mesma sessão → todos os online dessa sessão, sem atualizar. "
                     "Este é um comparador diagnóstico que pode usar IM2–IM6. adaptive_protocol: somente IM1 "
-                    "inicializa; prever online 1a → incorporar 1a → prever 1b → … → prever 2a após 1d. "
+                    "inicializa; mantém o mesmo modelo no lote online e só então incorpora seus rótulos. "
                     "IM2–IM6 NUNCA entram nesse treino. Atualização é supervisionada, com rótulos conhecidos, "
-                    "e refaz todo o pipeline cumulativamente. Não reproduz o feedback histórico do participante.")
+                    f"e refaz o pipeline cumulativamente a cada {cfg['classification'].get('adaptive_update_blocks', 2)} "
+                    "blocos online. Não reproduz o feedback histórico do participante.")
         if cfg["classification"]["allow_protocol_gaps"]:
             report.text("ATENÇÃO: allow_protocol_gaps=true. A sequência é parcial e usa apenas os blocos "
                         "observados; não representa a reprodução integral do protocolo.")
@@ -206,6 +234,13 @@ def analyze_subject(table, cfg, overwrite=False):
         tables = dict(inventory=pd.DataFrame(inventory+missing), trials=_concat(all_trials),
                       events=_concat(all_events), channel_qc=_concat(all_qc),
                       bandpower=_concat(all_power), scores=scores, predictions=predictions)
+        for name, columns in dict(
+            trials=["trial_id", "status", "reason", "eda_status", "eda_reason"],
+            events=["trial_id", "code", "time_s"], channel_qc=["channel", "source_channel"],
+            bandpower=["trial_id", "channel", "band", "baseline_power", "activity_power", "erd_percent"]
+        ).items():
+            if len(tables[name].columns) == 0:
+                tables[name] = pd.DataFrame(columns=["subject", "group", "session", "block", *columns])
         # Mesmo com classificação desligada, manter CSVs legíveis com cabeçalho.
         if tables["scores"].empty:
             tables["scores"] = pd.DataFrame(columns=["subject", "group", "session", "block", "experiment",
@@ -219,6 +254,8 @@ def analyze_subject(table, cfg, overwrite=False):
         public_cfg = {k: v for k, v in cfg.items() if k != "_config_dir"}
         (work / "config-used.yaml").write_text(yaml.safe_dump(public_cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
         provenance = dict(python=sys.version, command=sys.argv, synthetic=bool(cfg.get("_synthetic")),
+                          partial=any(r["status"] == "skipped_empty" for r in inventory),
+                          tfr_tests=tfr_tests,
                           versions={name: version(name) for name in ("numpy", "scipy", "pandas", "matplotlib",
                                      "scikit-learn", "mne", "pyriemann", "PyYAML")},
                           input_kind="synthetic" if cfg.get("_synthetic") else "experimental",
@@ -299,10 +336,14 @@ def main():
                         help="Acrescentar exclusão à busca automática; pode repetir. Nenhum arquivo é apagado.")
     parser.add_argument("--subject", help="Processar somente este sujeito.")
     parser.add_argument("--eda-only", action="store_true", help="Pular classificação.")
+    parser.add_argument("--skip-empty", action="store_true",
+                        help="Em run, omitir CSVs vazios com registro de execução parcial; outros erros continuam fatais.")
     parser.add_argument("--activity-window", type=float, nargs=2, metavar=("START", "STOP"),
                         help="Janela EDA fixa em segundos após o anchor; não altera os 2 s da classificação.")
     parser.add_argument("--overwrite", action="store_true", help="Substituir somente os arquivos de saída gerados.")
     args = parser.parse_args()
+    if args.skip_empty and args.command != "run":
+        raise ValueError("--skip-empty é exclusivo de run; inspect/diagnose sempre registram os erros.")
     cfg = load_config(args.config)
     if args.activity_window is not None:
         cfg["epochs"]["activity_s"] = args.activity_window
@@ -341,7 +382,7 @@ def main():
             diagnose(table, cfg, Path(cfg["paths"]["output"]) / "diagnostics.json", args.overwrite)
         else:
             for _, subject_table in table.groupby("subject", sort=True):
-                analyze_subject(subject_table, cfg, args.overwrite)
+                analyze_subject(subject_table, cfg, args.overwrite, args.skip_empty)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
-from scipy import signal
+from scipy import signal, stats
 
 from eeg_io import Recording, code
 
@@ -72,6 +72,16 @@ def validate_config(cfg):
         raise ValueError("cv_scheme inválido.")
     if cfg["classification"]["online_svm_kernel"] not in {"linear", "rbf"}:
         raise ValueError("online_svm_kernel inválido.")
+    interval = cfg["classification"].get("adaptive_update_blocks", 2)
+    if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
+        raise ValueError("adaptive_update_blocks deve ser um inteiro positivo.")
+    figures = cfg["figures"]
+    if not 0 < figures.get("tfr_alpha", .05) < 1:
+        raise ValueError("tfr_alpha deve estar entre 0 e 1.")
+    for name, minimum in (("tfr_permutations", 32), ("tfr_min_trials", 2)):
+        value = figures.get(name, 512 if name == "tfr_permutations" else 8)
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise ValueError(f"{name} deve ser um inteiro >= {minimum}.")
 
 
 def _causal_filter(x, sos):
@@ -250,7 +260,67 @@ def spectral_summary(rec, filtered, block, cfg, with_tfr=False):
     result = dict(f=f, baseline=np.stack(psd_base), activity=np.stack(psd_task))
     if with_tfr:
         result.update(time_frequency(rec, filtered, block, cfg))
+        result.update(tfr_significance(result, block, cfg))
     return result, pd.DataFrame(powers)
+
+
+def tfr_significance(summary, block, cfg):
+    """Clusters bilaterais de log-potência/baseline por tentativa, não por amostra EEG."""
+    from mne.stats import combine_adjacency, permutation_cluster_1samp_test
+
+    options = cfg["figures"]
+    channels = [c for c in cfg["spectral"]["channels_of_interest"] if c in block.channels]
+    frequency = ((summary["tf_f"] >= cfg["spectral"]["display_hz"][0]) &
+                 (summary["tf_f"] <= cfg["spectral"]["display_hz"][1]))
+    shape = (int(frequency.sum()), len(summary["tf_t"]))
+    masks, records = {}, []
+    family = max(1, len(channels)*2)
+    alpha = options.get("tfr_alpha", .05)
+
+    def t_stat(x):
+        sd = x.std(axis=0, ddof=1)
+        return np.divide(x.mean(axis=0)*np.sqrt(len(x)), sd, out=np.zeros_like(sd), where=sd > 0)
+
+    for channel in channels:
+        for label in ("left", "right"):
+            selected = block.trials.label.to_numpy() == label
+            n = int(selected.sum())
+            mask = np.zeros(shape, dtype=bool)
+            record = dict(channel=channel, label=label, n_trials=n, method="two_sided_sign_flip_log_ratio_clusters",
+                          family_panels=family, alpha=alpha, p_corrected=[], n_significant_bins=0,
+                          seed=cfg["classification"]["seed"], cluster_forming_alpha=.05,
+                          n_permutations=options.get("tfr_permutations", 512))
+            if not options.get("tfr_significance", True):
+                record["status"] = "disabled"
+            elif n < options.get("tfr_min_trials", 8):
+                record["status"] = "insufficient_trials"
+            else:
+                index = block.channels.index(channel)
+                absolute = summary["tf_absolute"][selected, index][:, frequency]
+                baseline = summary["tf_baseline"][selected, index][:, frequency, None]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    values = 10*np.log10(absolute/baseline)
+                valid = np.isfinite(values).all(axis=0)
+                valid &= summary["tf_t"][None, :] >= 0  # só pós-cue; baseline não é testada contra si mesma
+                values = np.where(np.isfinite(values), values, 0.)
+                valid &= values.std(axis=0) > 0
+                if not valid.any():
+                    record["status"] = "no_valid_bins"
+                else:
+                    _, clusters, p_values, null = permutation_cluster_1samp_test(
+                        values.reshape(n, -1), threshold=stats.t.ppf(1-.05/2, n-1), tail=0,
+                        stat_fun=t_stat, adjacency=combine_adjacency(*shape), exclude=~valid.ravel(),
+                        n_permutations=options.get("tfr_permutations", 512),
+                        rng=cfg["classification"]["seed"], n_jobs=1, out_type="indices", verbose=False)
+                    corrected = np.minimum(1., p_values*family)
+                    for cluster, p in zip(clusters, corrected):
+                        if p <= alpha:
+                            mask.ravel()[cluster[0]] = True
+                    record.update(status="tested", p_corrected=corrected.tolist(),
+                                  n_significant_bins=int(mask.sum()), effective_permutations=len(null))
+            masks[(channel, label)] = mask
+            records.append(record)
+    return dict(tfr_masks=masks, tfr_tests=records)
 
 
 def time_frequency(rec, filtered, block, cfg):
