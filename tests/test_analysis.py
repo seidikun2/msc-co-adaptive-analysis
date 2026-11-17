@@ -420,3 +420,34 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
         block = inventory.loc[(inventory.session == 1) & (inventory.block == 'im')].iloc[0]
         assert json.loads(block.duplicate_paths) == [str(copy)]
         assert len(block.duplicate_sha256) == 64
+
+
+@pytest.mark.parametrize('name', ['Organizacao_experimentos.csv', 'motor_16ch.csv',
+                                  'ORGANIZACAO_EXPERIMENTOS.CSV', 'MOTOR_16CH.CSV'])
+def test_auxiliaries_are_never_read_as_recordings(tmp_path, cfg, name):
+    auxiliary = tmp_path / name
+    auxiliary.write_text('channel;channel_label;x;y;z\nChannel 1;FC3;-63;24;53\n')
+    with pytest.raises(ValueError, match='Arquivo auxiliar, não é uma gravação EEG'):
+        read_recording(auxiliary, cfg)
+
+
+def test_old_manifest_auxiliary_rows_are_ignored(tmp_path, cfg, capsys):
+    cfg['paths'].update(data=str(tmp_path), manifest=str(tmp_path / 'inventory.csv'))
+    recording_path = tmp_path / 'motor_mi_TEST_1.csv'
+    recording_path.write_text('recording')
+    # Old inventories can include auxiliary rows with missing identification.
+    rows = [dict(path=recording_path.name, subject='TEST', session=1, block='im')]
+    rows += [dict(path=name, subject='', session='', block='')
+             for name in ('Organizacao_experimentos.csv', 'motor_16ch.csv')]
+    pd.DataFrame(rows).to_csv(cfg['paths']['manifest'], index=False)
+    table = discover(cfg)
+    assert table.path.tolist() == [str(recording_path)]
+    assert capsys.readouterr().out.count('Auxiliar ignorado no manifest') == 2
+
+
+@pytest.mark.parametrize('patterns', ['backup', [42]])
+def test_exclusion_patterns_require_a_list_of_strings(tmp_path, cfg, patterns):
+    cfg['paths'].update(data=str(tmp_path), manifest=None)
+    cfg['input']['exclude_globs'] = patterns
+    with pytest.raises(ValueError, match='input.exclude_globs deve ser uma lista'):
+        discover(cfg)

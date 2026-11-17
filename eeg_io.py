@@ -15,6 +15,13 @@ import pandas as pd
 import yaml
 
 
+AUXILIARY_CSVS = {"organizacao_experimentos.csv", "motor_16ch.csv"}
+
+
+def is_auxiliary_csv(path):
+    return Path(path).name.casefold() in AUXILIARY_CSVS
+
+
 @dataclass
 class Recording:
     path: Path
@@ -86,6 +93,8 @@ def _tokens(value):
 
 
 def read_recording(path, cfg):
+    if is_auxiliary_csv(path):
+        raise ValueError(f"Arquivo auxiliar, não é uma gravação EEG: {path}")
     frame = read_frame(path, cfg)
     options = cfg["input"]
     time_col = _column(frame, options.get("time_column"), ["time"], required=True)
@@ -180,8 +189,9 @@ def identify(path, cfg):
 def recording_paths(cfg):
     """Exclusões por nome ou glob relativo à raiz; pastas excluídas não são percorridas."""
     root = Path(cfg["paths"]["data"]).resolve()
-    patterns = ["Organizacao_experimentos.csv", "motor_16ch.csv"]
-    patterns += cfg["input"].get("exclude_globs", [])
+    patterns = cfg["input"].get("exclude_globs") or []
+    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+        raise ValueError("input.exclude_globs deve ser uma lista de nomes/padrões.")
 
     def excluded(path):
         relative = path.relative_to(root).as_posix().lower()
@@ -196,6 +206,9 @@ def recording_paths(cfg):
         dirs[:] = sorted(d for d in dirs if not excluded(Path(folder) / d))
         for name in sorted(files):
             path = Path(folder) / name
+            if is_auxiliary_csv(path):
+                print(f"Auxiliar ignorado (não é EEG): {path}", flush=True)
+                continue
             if path.suffix.lower() == ".csv" and not excluded(path):
                 yield path
 
@@ -240,6 +253,10 @@ def discover(cfg):
             raise ValueError(f"Manifest precisa de colunas {sorted(required)}")
         table = table.dropna(subset=["path"]).copy()
         table["path"] = table.path.map(lambda p: str((root / p).resolve()))
+        auxiliary = table.path.map(is_auxiliary_csv)
+        for path in table.loc[auxiliary, "path"].drop_duplicates():
+            print(f"Auxiliar ignorado no manifest (não é EEG): {path}", flush=True)
+        table = table.loc[~auxiliary].copy()
     else:
         rows, unknown = [], []
         for path in recording_paths(cfg):

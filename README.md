@@ -74,8 +74,26 @@ exclude_globs: [backup, 'rascunhos/*', '*_config.csv']
 Cada padrão corresponde ao nome ou ao caminho relativo à raiz `--data`, com `/`
 como separador. Uma pasta correspondente exclui toda a sua árvore. CSVs restantes
 fora da convenção continuam sendo sinalizados; não são descartados silenciosamente.
-As exclusões se aplicam à busca automática, não a arquivos indicados explicitamente
-em um manifest opcional.
+Os padrões personalizados se aplicam à busca automática. Os dois auxiliares
+conhecidos também são ignorados se aparecerem em um manifest antigo. O terminal
+mostra `Auxiliar ignorado (não é EEG)` para deixar essa decisão visível.
+
+`Organizacao_experimentos.csv` descreve a organização experimental.
+`motor_16ch.csv` descreve canais/eletrodos, não amostras: o formato fornecido é
+`channel;channel_label;x;y;z`, com `Channel 1` a `Channel 16` e `Channel Ref`.
+A linha de referência não é um 17º canal EEG. Esse arquivo pode fundamentar a
+montagem após verificar unidade e sistema de coordenadas; não é carregado
+automaticamente como EEG nem usado para confirmar a montagem provisória.
+
+Se ainda aparecer a mensagem antiga `Use inspect e um manifest` citando esses
+auxiliares, atualize seu checkout antes de executar (preserve alterações locais;
+se houver conflito, não use reset):
+
+```bash
+git switch main
+git pull --ff-only origin main
+git log -1 --oneline
+```
 
 Cópias do mesmo sujeito/sessão/bloco só são unificadas após SHA-256 idêntico.
 O caminho em ordem lexicográfica é mantido como representante **após** essa prova;
