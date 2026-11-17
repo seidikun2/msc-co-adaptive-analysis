@@ -61,7 +61,43 @@ dados/
 São esperados 36 arquivos por sujeito; faltas aparecem no inventário do relatório.
 O código não confunde `online_1a` com sessão/bloco offline.
 
-Para definir grupos, edite `group` no `inventory.csv` e use-o como manifest:
+**Não é necessário manifest nem inventory para executar.** Use diretamente `--data`;
+a busca entra nas subpastas dos sujeitos, inclusive dentro de outras pastas.
+`Organizacao_experimentos.csv` e `motor_16ch.csv` são sempre ignorados por
+`inspect` e `run` (sem diferenciar maiúsculas/minúsculas). Para excluir outros
+arquivos/pastas, configure no bloco `input` de `config.yaml`:
+
+```yaml
+exclude_globs: [backup, 'rascunhos/*', '*_config.csv']
+```
+
+Cada padrão corresponde ao nome ou ao caminho relativo à raiz `--data`, com `/`
+como separador. Uma pasta correspondente exclui toda a sua árvore. CSVs restantes
+fora da convenção continuam sendo sinalizados; não são descartados silenciosamente.
+As exclusões se aplicam à busca automática, não a arquivos indicados explicitamente
+em um manifest opcional.
+
+Cópias do mesmo sujeito/sessão/bloco só são unificadas após SHA-256 idêntico.
+O caminho em ordem lexicográfica é mantido como representante **após** essa prova;
+nenhum arquivo é apagado. As colunas `duplicate_paths` (lista JSON de caminhos
+absolutos), `duplicate_sha256` e `duplicate_entries` registram as cópias e linhas
+repetidas em `inspect` e no `inventory.csv` dentro de `tables.zip` do relatório.
+Conteúdos diferentes interrompem a operação com os caminhos, hashes e identificação
+do bloco. Conteúdo idêntico em sujeitos/sessões/blocos diferentes não é unificado.
+Repetições do mesmo caminho com os mesmos metadados são aceitas; metadados
+conflitantes são rejeitados.
+
+No Linux, com o ambiente `bci` ativado, execute na pasta do projeto:
+
+```bash
+python run_analysis.py run --data "/home/seidi/Área de trabalho/Dados Seidi" --eda-only --output results/eda
+python run_analysis.py run --data "/home/seidi/Área de trabalho/Dados Seidi" --output results/full
+```
+
+Os destinos separados preservam o EDA ao executar a análise completa. Se um destino
+já existir, escolha outro ou use `--overwrite` para substituir seus arquivos gerados.
+
+Opcionalmente, para definir grupos, edite `group` no `inventory.csv` e use-o como manifest:
 
 ```bash
 python run_analysis.py run --data /caminho/para/dados --manifest results/inventory.csv
@@ -78,7 +114,8 @@ manifest ou `input.filename_regex` com grupos `subject`, `session`, `block`.
 Edite `config.yaml` antes de `run`:
 
 1. **`events.attention`**: preencher com o código real identificado no cenário
-   OpenViBE ou na sequência de `markers.csv`. Sem ele a análise para, pois não
+   OpenViBE ou na sequência de `markers.csv` (padrão confirmado: `786`, cruz de
+   fixação/atenção). Sem ele a análise para, pois não
    existe baseline confiável. Não basta haver um código chamado `BaselineStart`:
    é preciso confirmar que corresponde à atenção deste protocolo.
 2. **`events.left` / `right`**: por padrão, GDF_Left `769` / GDF_Right `770`.
@@ -87,7 +124,8 @@ Edite `config.yaml` antes de `run`:
    explicitamente; a associação esquerda/direita não é adivinhada.
 3. **`events.task_start` / `rest_start` / `trial_stop`**: preencher/conferir
    conforme o cenário. `task_start` vazio não inventa início motor. O anchor
-   padrão é a cue; use `epochs.anchor: task_start` se houver esse marcador.
+   padrão atual é `task_start`, com `781` como início motor; `800` marca fim e pausa.
+   `32775/32776` pertencem à baseline geral, não à baseline individual por atenção.
 4. **`input.eeg_unit`**: começa como `native`, porque o cabeçalho fornecido não
    confirma a escala exportada pelo V-Amp/OpenViBE. Nesse modo, amplitudes/PSD
    estão em **u.a.**, e limiares físicos em µV ficam desativados; apenas canais

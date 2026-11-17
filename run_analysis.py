@@ -119,6 +119,9 @@ def analyze_subject(table, cfg, overwrite=False):
             all_events.append(events)
             all_power.append(powers.assign(**meta, position_confirmed=cfg["figures"]["montage_confirmed"]))
             inventory.append(dict(**meta, path=row.path, sha256=_sha256(row.path), sfreq=rec.sfreq,
+                                  duplicate_paths=row.duplicate_paths,
+                                  duplicate_entries=row.duplicate_entries,
+                                  duplicate_sha256=row.duplicate_sha256,
                                   n_channels=len(block.channels), n_trials=len(trials), n_accepted=len(block.X),
                                   duration_s=len(rec.times)/rec.sfreq, status="available"))
             if draw:

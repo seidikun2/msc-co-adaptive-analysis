@@ -7,6 +7,9 @@ input:
   # Convenção confirmada: motor_me_EG102_1, motor_mi_EG102_1, motor_mi_EG102_online_1a.
   # null usa essa convenção; regex customizado deve ter subject/session/block.
   filename_regex: null
+  # Nomes ou globs relativos à raiz --data; nomes de pastas excluem toda a árvore.
+  # Os CSVs Organizacao_experimentos.csv e motor_16ch.csv são sempre ignorados.
+  exclude_globs: []  # exemplo: [backup, 'rascunhos/*', '*_config.csv']
   separator: auto
   decimal: '.'
   eeg_unit: native     # unidade desconhecida: native (u.a.); depois confirmar V, mV ou uV

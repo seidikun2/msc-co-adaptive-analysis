@@ -4,6 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import csv
+import fnmatch
+import hashlib
+import json
+import os
 import re
 
 import numpy as np
@@ -173,6 +177,59 @@ def identify(path, cfg):
     return None
 
 
+def recording_paths(cfg):
+    """Exclusões por nome ou glob relativo à raiz; pastas excluídas não são percorridas."""
+    root = Path(cfg["paths"]["data"]).resolve()
+    patterns = ["Organizacao_experimentos.csv", "motor_16ch.csv"]
+    patterns += cfg["input"].get("exclude_globs", [])
+
+    def excluded(path):
+        relative = path.relative_to(root).as_posix().lower()
+        return any(fnmatch.fnmatchcase(relative, p.rstrip("/").lower()) or
+                   fnmatch.fnmatchcase(path.name.lower(), p.rstrip("/").lower())
+                   for p in patterns)
+
+    def fail(error):
+        raise error
+
+    for folder, dirs, files in os.walk(root, onerror=fail):
+        dirs[:] = sorted(d for d in dirs if not excluded(Path(folder) / d))
+        for name in sorted(files):
+            path = Path(folder) / name
+            if path.suffix.lower() == ".csv" and not excluded(path):
+                yield path
+
+
+def _deduplicate(table):
+    """Só une cópias do mesmo bloco; mantém evidência em colunas exportáveis."""
+    keys = ["subject", "session", "block", "group"]
+    for path, rows in table.groupby("path", sort=True):
+        if len(rows[keys].drop_duplicates()) > 1:
+            raise ValueError(f"Arquivo com metadados conflitantes: {path}: "
+                             f"{rows[keys].to_dict('records')}")
+    unique = []
+    for identity, rows in table.groupby(keys, sort=True, dropna=False):
+        paths = sorted(set(rows.path))
+        hashes = {}
+        # Hash necessário apenas quando há arquivos distintos para o mesmo bloco.
+        if len(paths) > 1:
+            for path in paths:
+                digest = hashlib.sha256()
+                with Path(path).open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                        digest.update(chunk)
+                hashes[path] = digest.hexdigest()
+            if len(set(hashes.values())) > 1:
+                raise ValueError(f"Gravações com conteúdo diferente para "
+                                 f"subject/session/block/group={identity}: {hashes}")
+        row = rows.loc[rows.path == paths[0]].iloc[0].copy()
+        row["duplicate_paths"] = json.dumps(paths[1:], ensure_ascii=False)
+        row["duplicate_entries"] = len(rows) - len(paths)
+        row["duplicate_sha256"] = hashes.get(paths[0], "")
+        unique.append(row)
+    return pd.DataFrame(unique).reset_index(drop=True)
+
+
 def discover(cfg):
     root = Path(cfg["paths"]["data"]).resolve()
     manifest = cfg["paths"].get("manifest")
@@ -185,15 +242,16 @@ def discover(cfg):
         table["path"] = table.path.map(lambda p: str((root / p).resolve()))
     else:
         rows, unknown = [], []
-        for path in sorted(root.rglob("*.csv")):
+        for path in recording_paths(cfg):
             fields = identify(path, cfg)
             if fields:
                 rows.append(dict(path=str(path.resolve()), **fields))
             else:
                 unknown.append(str(path.relative_to(root)))
         if unknown:
-            raise ValueError("Arquivos sem sessão/bloco inequívocos. Use `inspect` e um "
-                             f"manifest, sem adivinhar a numeração: {unknown[:8]}")
+            raise ValueError("Arquivos sem sessão/bloco inequívocos. Exclua CSVs auxiliares com "
+                             "input.exclude_globs; para gravações, configure filename_regex "
+                             f"ou um manifest: {unknown}")
         table = pd.DataFrame(rows)
     if table.empty:
         raise ValueError(f"Nenhuma gravação encontrada em {root}")
@@ -206,8 +264,6 @@ def discover(cfg):
     table["block"] = table.block.str.lower()
     if not table.block.isin(BLOCKS).all():
         raise ValueError(f"block deve ser um de {BLOCKS}; use im para imagética.")
-    if table.duplicated(["subject", "session", "block"]).any() or table.path.duplicated().any():
-        raise ValueError("Manifest com bloco ou arquivo duplicado.")
     if not table.path.map(lambda p: Path(p).is_file()).all():
         raise ValueError("Arquivo do manifest não encontrado.")
     if not table.subject.str.fullmatch(r"[A-Za-z0-9_-]+").all():
@@ -217,6 +273,7 @@ def discover(cfg):
     table["group"] = table.group.fillna("unspecified")
     if (table.groupby("subject").group.nunique() > 1).any():
         raise ValueError("Um sujeito está atribuído a mais de um grupo.")
+    table = _deduplicate(table)
     table["_order"] = table.block.map(dict(zip(BLOCKS, range(len(BLOCKS)))))
     return table.sort_values(["subject", "session", "_order"]).drop(columns="_order")
 
@@ -225,9 +282,18 @@ def inspect_folder(cfg):
     """Lê um arquivo de cada vez; não exige unidades, códigos de atenção ou manifest."""
     root = Path(cfg["paths"]["data"]).resolve()
     rows, markers = [], []
-    for path in sorted(root.rglob("*.csv")):
+    paths = list(recording_paths(cfg))
+    known = [dict(path=str(p.resolve()), group="unspecified", **identify(p, cfg))
+             for p in paths if identify(p, cfg)]
+    canonical = _deduplicate(pd.DataFrame(known)) if known else pd.DataFrame()
+    metadata = {r["path"]: r for r in canonical.to_dict("records")}
+    for path in paths:
+        if identify(path, cfg) and str(path.resolve()) not in metadata:
+            continue
         row = dict(path=str(path.relative_to(root)), subject="", session="", block="", group="")
         row.update(identify(path, cfg) or {})
+        if str(path.resolve()) in metadata:
+            row.update({k: v for k, v in metadata[str(path.resolve())].items() if k != "path"})
         try:
             rec = read_recording(path, cfg)
             markers.append(rec.events.assign(path=row["path"],

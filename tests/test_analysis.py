@@ -277,3 +277,146 @@ def test_protocol_never_initializes_from_im2(cfg, monkeypatch):
     monkeypatch.setattr(classification, "make_model", spy_factory([]))
     scores, _ = classification.classify_subject([toy_block(2, "im", 200), toy_block(2, "online_a", 210)], cfg)
     assert scores.loc[scores.experiment == "adaptive_protocol", "reason"].tolist() == ["missing_session_1_im"]
+
+
+def test_discovery_excludes_auxiliary_files_and_directories(tmp_path, cfg):
+    from eeg_io import inspect_folder
+    cfg['paths'].update(data=str(tmp_path), manifest=None)
+    cfg['input']['exclude_globs'] = ['backup', 'nested/ignore_*', '*_config.csv']
+    for name in ('Organizacao_experimentos.csv', 'motor_16ch.csv',
+                 'other_config.csv', 'backup/bad.csv', 'nested/ignore_this/bad.csv'):
+        p = tmp_path / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('not EEG')
+    rec = recording(cfg)
+    frame = pd.DataFrame(rec.signal.T, columns=cfg['input']['channels'])
+    frame.insert(0, 'Time:128Hz', rec.times)
+    p = tmp_path / 'nested' / 'subject' / 'motor_mi_TEST_1.csv'
+    p.parent.mkdir(parents=True)
+    frame.to_csv(p, index=False)
+    assert len(discover(cfg)) == 1
+    inventory, _ = inspect_folder(cfg)
+    assert len(inventory) == 1
+    assert inventory.error.tolist() == ['']
+
+
+def test_identical_block_copies_are_traced_in_discovery_and_inspect(tmp_path, cfg):
+    import json
+    from eeg_io import inspect_folder
+    cfg['paths'].update(data=str(tmp_path), manifest=None)
+    paths = [tmp_path / folder / 'motor_mi_TEST_1.csv' for folder in ('a', 'b')]
+    for p in paths:
+        p.parent.mkdir()
+        p.write_text('same recording')
+    table = discover(cfg)
+    assert len(table) == 1
+    assert table.iloc[0].path == str(paths[0])
+    assert json.loads(table.iloc[0].duplicate_paths) == [str(paths[1])]
+    assert len(table.iloc[0].duplicate_sha256) == 64
+    inventory, _ = inspect_folder(cfg)
+    assert len(inventory) == 1
+    assert inventory.iloc[0].duplicate_paths == table.iloc[0].duplicate_paths
+
+
+def test_different_block_copies_report_identity_and_all_paths(tmp_path, cfg):
+    from eeg_io import inspect_folder
+    cfg['paths'].update(data=str(tmp_path), manifest=None)
+    paths = [tmp_path / folder / 'motor_mi_TEST_online_2b.csv' for folder in ('a', 'b')]
+    for i, p in enumerate(paths):
+        p.parent.mkdir()
+        p.write_text(str(i))
+    for operation in (discover, inspect_folder):
+        with pytest.raises(ValueError) as error:
+            operation(cfg)
+        assert 'TEST' in str(error.value) and 'online_b' in str(error.value)
+        assert all(str(p) in str(error.value) for p in paths)
+
+
+def test_identical_content_does_not_merge_different_identities(tmp_path, cfg):
+    cfg['paths'].update(data=str(tmp_path), manifest=None)
+    for name in ('motor_mi_TEST_1.csv', 'motor_mi_TEST_2.csv',
+                 'motor_me_TEST_1.csv', 'motor_mi_OTHER_1.csv'):
+        (tmp_path / name).write_text('identical bytes')
+    assert len(discover(cfg)) == 4
+
+
+def test_repeated_manifest_rows_are_unified_but_metadata_conflicts_fail(tmp_path, cfg):
+    path = tmp_path / 'motor_mi_TEST_1.csv'
+    path.write_text('recording')
+    manifest = tmp_path / 'manifest.csv'
+    cfg['paths'].update(data=str(tmp_path), manifest=str(manifest))
+    row = dict(path=path.name, subject='TEST', session=1, block='im')
+    pd.DataFrame([row, row]).to_csv(manifest, index=False)
+    table = discover(cfg)
+    assert len(table) == 1 and table.iloc[0].duplicate_entries == 1
+    pd.DataFrame([row, dict(row, session=2)]).to_csv(manifest, index=False)
+    with pytest.raises(ValueError, match='metadados conflitantes'):
+        discover(cfg)
+
+
+def test_manifest_distinct_paths_require_identical_content(tmp_path, cfg):
+    paths = [tmp_path / name for name in ('first.csv', 'second.csv')]
+    for path in paths:
+        path.write_text('same')
+    manifest = tmp_path / 'manifest.csv'
+    cfg['paths'].update(data=str(tmp_path), manifest=str(manifest))
+    pd.DataFrame([dict(path=p.name, subject='TEST', session=1, block='im')
+                  for p in paths]).to_csv(manifest, index=False)
+    assert len(discover(cfg)) == 1
+    paths[1].write_text('different')
+    with pytest.raises(ValueError, match='conteúdo diferente'):
+        discover(cfg)
+
+
+def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
+    """Exercise inspect, EDA and all classifiers with real CSV parsing/report output."""
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    from zipfile import ZipFile
+    from run_analysis import make_demo
+
+    project = Path(__file__).resolve().parents[1]
+    synthetic = tmp_path / 'synthetic'
+    make_demo(synthetic, load_config(project / 'config.yaml'))
+    data = synthetic / 'data'
+    original = data / 'SYNTHETIC' / 'motor_mi_SYNTHETIC_1.csv'
+    copy = data / 'copies' / original.name
+    copy.parent.mkdir()
+    shutil.copyfile(original, copy)
+    for name in ('Organizacao_experimentos.csv', 'motor_16ch.csv'):
+        (data / name).write_text('configuration,not EEG\n1,2\n')
+    environment = dict(os.environ, MPLBACKEND='Agg',
+                       MPLCONFIGDIR=str(tmp_path / 'mpl'),
+                       OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1')
+    for command, extra in (('inspect', []), ('eda', ['--eda-only']), ('full', [])):
+        output = tmp_path / command
+        result = subprocess.run(
+            [sys.executable, str(project / 'run_analysis.py'),
+             'inspect' if command == 'inspect' else 'run',
+             '--config', str(synthetic / 'config.yaml'), '--data', str(data),
+             '--output', str(output), *extra],
+            cwd=project, env=environment, capture_output=True, text=True, timeout=180)
+        assert result.returncode == 0, result.stdout + result.stderr
+        if command == 'inspect':
+            inventory = pd.read_csv(output / 'inventory.csv')
+            assert len(inventory) == 12
+            assert inventory.error.isna().all()
+        else:
+            folder = output / 'SYNTHETIC'
+            assert (folder / 'report.html').stat().st_size > 0
+            assert (folder / 'figures.pdf').read_bytes().startswith(b'%PDF')
+            with ZipFile(folder / 'tables.zip') as archive:
+                inventory = pd.read_csv(archive.open('inventory.csv'))
+                trials = pd.read_csv(archive.open('trials.csv'))
+                scores = pd.read_csv(archive.open('scores.csv'))
+                assert len(trials) == 96
+                if command == 'full':
+                    assert len(scores) > 0 and set(scores.status) == {'ok'}
+                else:
+                    assert scores.empty
+        block = inventory.loc[(inventory.session == 1) & (inventory.block == 'im')].iloc[0]
+        assert json.loads(block.duplicate_paths) == [str(copy)]
+        assert len(block.duplicate_sha256) == 64
