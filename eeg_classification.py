@@ -7,6 +7,7 @@ from pyriemann.estimation import Covariances
 from pyriemann.spatialfilters import CSP
 from pyriemann.tangentspace import TangentSpace
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, cohen_kappa_score
 from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
@@ -18,12 +19,25 @@ def _to_uv(X):
     return X*1e6
 
 
+def pipeline_specs(cfg):
+    if cfg["classification"].get("pipelines", "tgsp_lr") == "tgsp_lr":
+        return [("TGSP", "LR")]
+    return [(f, c) for f in ("TGSP", "CSP") for c in ("LDA", "SVM-linear", "SVM-rbf")]
+
+
+def online_classifier(cfg):
+    return "LR" if cfg["classification"].get("pipelines", "tgsp_lr") == "tgsp_lr" else "SVM-"+cfg["classification"]["online_svm_kernel"]
+
+
 def make_model(feature, classifier, n_channels, cfg):
     """Cada .fit aprende CSP/espaço tangente/escala SÓ do treino recebido."""
     settings = cfg["classification"]
     spatial = (TangentSpace(metric="riemann", tsupdate=False) if feature == "TGSP" else
                CSP(nfilter=min(settings["csp_components"], n_channels-1), metric="euclid", log=True))
-    if classifier == "LDA":
+    if classifier == "LR":
+        head = LogisticRegression(C=1., class_weight="balanced", max_iter=2000,
+                                  solver="lbfgs", random_state=settings["seed"])
+    elif classifier == "LDA":
         head = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
     else:
         head = SVC(kernel="linear" if classifier == "SVM-linear" else "rbf",
@@ -72,47 +86,46 @@ def cross_validate(block, cfg):
     y = block.trials.label.to_numpy()
     counts = pd.Series(y).value_counts()
     scores, predictions = [], []
-    for feature in ("TGSP", "CSP"):
-        for classifier in ("LDA", "SVM-linear", "SVM-rbf"):
-            name = f"{feature}+{classifier}"
-            k = min(settings["cv_folds"], counts.min() if len(counts) == 2 else 0)
-            if k < 2:
-                scores.append(_skip(block, "offline_cv", name, "fewer_than_two_trials_per_class"))
+    for feature, classifier in pipeline_specs(cfg):
+        name = f"{feature}+{classifier}"
+        k = min(settings["cv_folds"], counts.min() if len(counts) == 2 else 0)
+        if k < 2:
+            scores.append(_skip(block, "offline_cv", name, "fewer_than_two_trials_per_class"))
+            continue
+        if settings["cv_scheme"] == "forward":
+            splits = TimeSeriesSplit(n_splits=int(k)).split(block.X)
+        else:
+            splits = StratifiedKFold(int(k), shuffle=True, random_state=settings["seed"]).split(block.X, y)
+        oof_indices, oof_pred, train_sizes = [], [], []
+        for fold, (train, test) in enumerate(splits, 1):
+            train_counts = pd.Series(y[train]).value_counts()
+            invalid = ("training_fold_has_one_class" if len(train_counts) < 2 else
+                       "fewer_than_two_training_trials_per_class" if classifier == "LDA" and train_counts.min() < 2 else "")
+            if invalid:
+                scores.append(dict(_skip(block, "offline_cv", name, invalid),
+                                   fold=str(fold)))
                 continue
-            if settings["cv_scheme"] == "forward":
-                splits = TimeSeriesSplit(n_splits=int(k)).split(block.X)
-            else:
-                splits = StratifiedKFold(int(k), shuffle=True, random_state=settings["seed"]).split(block.X, y)
-            oof_indices, oof_pred, train_sizes = [], [], []
-            for fold, (train, test) in enumerate(splits, 1):
-                train_counts = pd.Series(y[train]).value_counts()
-                invalid = ("training_fold_has_one_class" if len(train_counts) < 2 else
-                           "fewer_than_two_training_trials_per_class" if classifier == "LDA" and train_counts.min() < 2 else "")
-                if invalid:
-                    scores.append(dict(_skip(block, "offline_cv", name, invalid),
-                                       fold=str(fold)))
-                    continue
-                model = make_model(feature, classifier, len(block.channels), cfg)
-                model.fit(block.X[train], y[train])
-                pred = model.predict(block.X[test])
-                scores.append(_score_row(block, "offline_cv", name, y[test], pred, len(train),
-                                         _block_name(block), fold))
-                predictions.append(_prediction_rows(block, "offline_cv", name, test, pred, fold))
-                oof_indices.extend(test)
-                oof_pred.extend(pred)
-                train_sizes.append(len(train))
-            if oof_indices:
-                pooled = _score_row(block, "offline_cv", name, y[oof_indices], oof_pred,
-                                    min(train_sizes), _block_name(block))
-                pooled["coverage"] = len(oof_indices)/len(y)
-                scores.append(pooled)
-            else:
-                scores.append(_skip(block, "offline_cv", name, "no_valid_training_folds"))
+            model = make_model(feature, classifier, len(block.channels), cfg)
+            model.fit(block.X[train], y[train])
+            pred = model.predict(block.X[test])
+            scores.append(_score_row(block, "offline_cv", name, y[test], pred, len(train),
+                                     _block_name(block), fold))
+            predictions.append(_prediction_rows(block, "offline_cv", name, test, pred, fold))
+            oof_indices.extend(test)
+            oof_pred.extend(pred)
+            train_sizes.append(len(train))
+        if oof_indices:
+            pooled = _score_row(block, "offline_cv", name, y[oof_indices], oof_pred,
+                                min(train_sizes), _block_name(block))
+            pooled["coverage"] = len(oof_indices)/len(y)
+            scores.append(pooled)
+        else:
+            scores.append(_skip(block, "offline_cv", name, "no_valid_training_folds"))
     return scores, predictions
 
 
 def _transfer(train_blocks, test, experiment, cfg, feature="TGSP", classifier=None, models=None):
-    classifier = classifier or "SVM-"+cfg["classification"]["online_svm_kernel"]
+    classifier = classifier or online_classifier(cfg)
     name = feature+"+"+classifier
     usable = [b for b in train_blocks if len(b.X)]
     if not usable or not len(test.X):
@@ -156,22 +169,20 @@ def classify_subject(blocks, cfg):
     by_key = {(b.meta["session"], b.meta["block"]): b for b in blocks}
     online = sorted([b for b in blocks if b.meta["block"].startswith("online_")],
                     key=lambda b: (b.meta["session"], b.meta["block"]))
-    name = "TGSP+SVM-"+cfg["classification"]["online_svm_kernel"]
+    name = "TGSP+"+online_classifier(cfg)
     frozen_models = {}
     for test in online:
         im = by_key.get((test.meta["session"], "im"))
         if im is None:
-            for feature in ("TGSP", "CSP"):
-                for classifier in ("LDA", "SVM-linear", "SVM-rbf"):
-                    scores.append(_skip(test, "session_im_frozen", feature+"+"+classifier, "missing_same_session_im"))
+            for feature, classifier in pipeline_specs(cfg):
+                scores.append(_skip(test, "session_im_frozen", feature+"+"+classifier, "missing_same_session_im"))
         else:
             models = frozen_models.setdefault(test.meta["session"], {})
-            for feature in ("TGSP", "CSP"):
-                for classifier in ("LDA", "SVM-linear", "SVM-rbf"):
-                    score, pred = _transfer([im], test, "session_im_frozen", cfg, feature, classifier, models)
-                    scores.append(score)
-                    if pred is not None:
-                        predictions.append(pred)
+            for feature, classifier in pipeline_specs(cfg):
+                score, pred = _transfer([im], test, "session_im_frozen", cfg, feature, classifier, models)
+                scores.append(score)
+                if pred is not None:
+                    predictions.append(pred)
     initial = by_key.get((1, "im"))
     if initial is None:
         scores.extend(_skip(b, "adaptive_protocol", name, "missing_session_1_im") for b in online)

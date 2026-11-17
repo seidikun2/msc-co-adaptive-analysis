@@ -27,6 +27,7 @@ class Report:
         self.output, self.cfg = output, cfg
         self.pdf = PdfPages(output / "figures.pdf")
         title = "EDA e classificação de EEG" if cfg["classification"]["enabled"] else "EDA de EEG"
+        self.title = f"{title} — {subject}"
         self.parts = [f"<h1>{title} — {escape(subject)}</h1>"]
         if not cfg["classification"]["enabled"]:
             self.text("SOMENTE EDA: classificadores não foram treinados. Acurácias, CV e testes online "
@@ -68,7 +69,7 @@ class Report:
         self.pdf.close()
         html = ("<!doctype html><html lang='pt-BR'><meta charset='utf-8'>"
                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                "<title>EDA de EEG</title><style>body{max-width:1100px;margin:2em auto;"
+                f"<title>{escape(self.title)}</title><style>body{{max-width:1100px;margin:2em auto;"
                 "font:16px/1.5 system-ui;padding:0 1em;color:#222}img{max-width:100%}"
                 "figure{margin:1em 0}figcaption{color:#444}table{border-collapse:collapse;"
                 "font-size:12px;display:block;overflow-x:auto}td,th{padding:.4em;border:1px solid #ddd}"
@@ -399,27 +400,28 @@ def topomap_plot(powers, block, cfg, relative=False):
 
 
 def classification_figures(scores, predictions, report):
+    from eeg_classification import online_classifier
     if scores.empty:
         return
     pooled = scores.loc[(scores.status == "ok") & (scores.fold == "all")]
     offline = pooled.loc[pooled.experiment == "offline_cv"]
     if len(offline):
-        names = [f"{f}+{c}" for f in ("TGSP", "CSP") for c in ("LDA", "SVM-linear", "SVM-rbf")]
+        names = sorted(offline.pipeline.unique())
         fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
         for ax, block in zip(axes, ("me", "im")):
             data = offline.loc[offline.block == block]
             for session, rows in data.groupby("session"):
                 values = rows.set_index("pipeline").balanced_accuracy.reindex(names)*100
-                ax.plot(range(6), values, "o-", lw=.8, label=f"Sessão {session}")
+                ax.plot(range(len(names)), values, "o-", lw=.8, label=f"Sessão {session}")
             ax.set_title("Execução motora" if block == "me" else "Imagética motora")
-            ax.set_xticks(range(6), names, rotation=35, ha="right")
+            ax.set_xticks(range(len(names)), names, rotation=35, ha="right")
             ax.set_ylim(0, 103)
             ax.axhline(50, ls="--", color="gray", lw=.8)
             ax.set_ylabel("Acurácia balanceada OOF (%)")
             if len(data):
                 ax.legend(fontsize=7)
-        report.figure(fig, "Comparação dos seis pipelines nos blocos offline",
-                      "Uma janela de 2 s por tentativa. CSP, referência tangente e escala são ajustados "
+        report.figure(fig, "Classificação nos blocos offline · "+", ".join(names),
+                      "Uma janela de 2 s por tentativa. Representação espacial e escala são ajustadas "
                       "dentro de cada fold. Pontos são resultados OOF de cada sessão, sem teste inferencial entre folds.")
     online = pooled.loc[pooled.experiment.isin(["session_im_frozen", "adaptive_protocol"])]
     if len(online):
@@ -431,7 +433,7 @@ def classification_figures(scores, predictions, report):
             rows = rows.sort_values(["session", "block"])
             x = [lookup[(r.session, r.block)] for r in rows.itertuples()]
             axes[0].plot(x, rows.accuracy*100, "o-", lw=.8, label=name)
-        chosen = "TGSP+SVM-"+report.cfg["classification"]["online_svm_kernel"]
+        chosen = "TGSP+"+online_classifier(report.cfg)
         interval = report.cfg["classification"].get("adaptive_update_blocks", 2)
         for experiment, color, label in (("session_im_frozen", "#777777", "IM da mesma sessão (congelado)"),
                                          ("adaptive_protocol", "#0072B2", f"IM1 + online (atualiza a cada {interval})")):
@@ -447,7 +449,7 @@ def classification_figures(scores, predictions, report):
             ax.set_xlabel("Ordem cronológica dos blocos online")
             ax.legend(fontsize=7)
         axes[0].set_ylabel("Acurácia no bloco teste (%)")
-        axes[0].set_title("Seis pipelines: MI → online, sem atualização")
+        axes[0].set_title("MI → online, sem atualização")
         axes[1].set_title(chosen+f" · atualização a cada {interval} blocos")
         report.figure(fig, "Decodificação online e pseudo-coadaptação supervisionada",
                       "Predição antes de incorporar os rótulos do lote de blocos teste. Faixas: IC de Wilson de 95% "
@@ -458,7 +460,7 @@ def classification_figures(scores, predictions, report):
         fig, axes = plt.subplots(1, 2, figsize=(8, 4))
         for ax, experiment in zip(axes, ("session_im_frozen", "adaptive_protocol")):
             rows = predictions.loc[(predictions.experiment == experiment) &
-                                   (predictions.pipeline == "TGSP+SVM-"+report.cfg["classification"]["online_svm_kernel"])]
+                                   (predictions.pipeline == "TGSP+"+online_classifier(report.cfg))]
             if rows.empty:
                 ax.set_visible(False)
                 continue
@@ -474,4 +476,4 @@ def classification_figures(scores, predictions, report):
             ax.set_xlabel("Predição")
             ax.set_ylabel("Classe real")
             ax.set_title(experiment)
-        report.figure(fig, "Matrizes de confusão dos testes online", "Contagens e proporções por classe verdadeira, apenas para o mesmo pipeline TGSP+SVM nos dois protocolos.")
+        report.figure(fig, "Matrizes de confusão dos testes online", "Contagens e proporções por classe verdadeira, apenas para o mesmo pipeline TGSP nos dois protocolos.")

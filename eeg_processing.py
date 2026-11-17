@@ -77,6 +77,8 @@ def validate_config(cfg):
     if cfg["classification"]["online_svm_kernel"] not in {"linear", "rbf"}:
         raise ValueError("online_svm_kernel inválido.")
     interval = cfg["classification"].get("adaptive_update_blocks", 2)
+    if cfg["classification"].get("pipelines", "tgsp_lr") not in {"tgsp_lr", "all"}:
+        raise ValueError("classification.pipelines deve ser tgsp_lr ou all.")
     if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
         raise ValueError("adaptive_update_blocks deve ser um inteiro positivo.")
     figures = cfg["figures"]

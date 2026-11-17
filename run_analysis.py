@@ -232,9 +232,9 @@ def analyze_subject(table, cfg, overwrite=False, skip_empty=False, skip_missing_
         if not blocks:
             report.text("Nenhuma gravação utilizável neste sujeito; todos os arquivos foram omitidos. "
                         "Não há medidas EDA nem resultados de classificação.")
-        report.text("CV offline: "+cfg["classification"]["cv_scheme"]+". TGSP = covariância Ledoit–Wolf → "
-                    "espaço tangente riemanniano; CSP usa as mesmas covariâncias regularizadas. "
-                    "Ambos usam escala aprendida no treino e LDA com shrinkage ou SVM de parâmetros fixos. "
+        report.text("CV offline: "+cfg["classification"]["cv_scheme"]+". Modelo padrão: TGSP+LR, "
+                    "covariância Ledoit–Wolf → espaço tangente → StandardScaler → regressão logística "
+                    "balanceada (C=1). Representação e escala são aprendidas só no treino de cada fold. "
                     "CV estratificada mede generalização dentro do bloco e pode ser otimista sob deriva temporal; "
                     "use cv_scheme=forward como sensibilidade. Não há seleção de hiperparâmetros no teste.")
         report.text("session_im_frozen: IM da mesma sessão → todos os online dessa sessão, sem atualizar. "
@@ -348,7 +348,7 @@ def make_demo(output, base_cfg):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["inspect", "diagnose", "run", "demo"])
+    parser.add_argument("command", choices=["inspect", "diagnose", "run", "summarize", "demo"])
     parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")))
     parser.add_argument("--data", help="Sobrescreve paths.data; aceita árvore com pastas de sujeitos.")
     parser.add_argument("--output", help="Sobrescreve paths.output; para demo é a pasta da demonstração.")
@@ -382,6 +382,15 @@ def main():
             cfg["paths"][name] = str(Path(getattr(args, name)).resolve())
     if args.command == "demo":
         make_demo(args.output or "demo", cfg)
+    elif args.command == "summarize":
+        from eeg_summary import write_summary
+        output = Path(cfg["paths"]["output"])
+        subjects = sorted(p.name for p in output.iterdir() if p.is_dir() and (p / "tables.zip").is_file())
+        if args.subject:
+            subjects = [s for s in subjects if s == args.subject]
+        if not subjects:
+            raise ValueError("Nenhum relatório individual encontrado para resumir.")
+        write_summary(output, subjects, cfg, args.overwrite)
     elif args.command == "inspect":
         target = Path(cfg["paths"]["output"])
         target.mkdir(parents=True, exist_ok=True)
@@ -406,9 +415,19 @@ def main():
         if args.command == "diagnose":
             diagnose(table, cfg, Path(cfg["paths"]["output"]) / "diagnostics.json", args.overwrite)
         else:
+            output = Path(cfg["paths"]["output"])
+            if cfg["classification"].get("pipelines", "tgsp_lr") == "all" and (output / "report.html").exists():
+                raise ValueError("Modo all exige outra saída para preservar o resumo TGSP+LR existente.")
+            if (output / "report.html").exists() and not args.overwrite:
+                raise ValueError(f"Resumo {output / 'report.html'} já existe; use outra saída ou --overwrite.")
+            subjects = []
             for _, subject_table in table.groupby("subject", sort=True):
                 analyze_subject(subject_table, cfg, args.overwrite, args.skip_empty, args.skip_missing_attention,
                                 args.skip_invalid_eeg)
+                subjects.append(str(subject_table.subject.iloc[0]))
+            if cfg["classification"].get("pipelines", "tgsp_lr") == "tgsp_lr":
+                from eeg_summary import write_summary
+                write_summary(output, subjects, cfg, args.overwrite)
 
 
 if __name__ == "__main__":

@@ -67,6 +67,7 @@ spectral:
   channels_of_interest: [C3, Cz, C4]
 
 classification:
+  pipelines: tgsp_lr # somente TGSP + regressão logística; all mantém os seis modelos antigos
   enabled: true
   frequency_hz: [8.0, 30.0]
   cv_folds: 5

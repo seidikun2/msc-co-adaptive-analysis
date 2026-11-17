@@ -13,6 +13,7 @@ from eeg_processing import EpochBlock, prepare_block, preprocess, spectral_summa
 @pytest.fixture
 def cfg():
     cfg = load_config(Path(__file__).parents[1] / "config.yaml")
+    cfg["classification"]["pipelines"] = "all"  # regressões do modo legado; integração usa o padrão TGSP+LR
     cfg["input"].update(eeg_unit="uV", sfreq=128)
     cfg["events"].update(attention=[33024], task_start=[33027])
     return cfg
@@ -429,6 +430,13 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
                if command == 'inspect' else ['--skip-empty', '--skip-missing-attention', '--skip-invalid-eeg']), *extra],
             cwd=project, env=environment, capture_output=True, text=True, timeout=180)
         assert result.returncode == 0, result.stdout + result.stderr
+        if command != 'inspect':
+            assert (output / 'report.html').is_file()
+            assert json.loads((output / 'summary-info.json').read_text())['subjects'] == ['SYNTHETIC']
+            with ZipFile(output / 'summary-tables.zip') as summary_zip:
+                statistics = pd.read_csv(summary_zip.open('statistics.csv'))
+                assert len(statistics) == 10
+                assert statistics.status.eq('insufficient_subjects').all()
         if command == 'inspect':
             inventory = pd.read_csv(output / 'inventory.csv')
             assert len(inventory) == 11
@@ -463,6 +471,7 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
                     assert not powers.block.str.startswith('online_').any()
                 if command == 'full':
                     assert len(scores) > 0 and set(scores.status) == {'ok', 'skipped'}
+                    assert set(scores.pipeline) == {'TGSP+LR'}
                     skipped = scores.loc[scores.status == 'skipped']
                     assert set(skipped.experiment) == {'session_im_frozen'}
                     assert skipped.session.eq(2).all()
@@ -889,3 +898,8 @@ def test_invalid_eeg_skip_is_explicit_audited_and_cannot_hide_config_errors(tmp_
     cfg['paths']['output'] = str(tmp_path / 'bad_config')
     with pytest.raises(ValueError, match='Seleção de canais'):
         analyze_subject(table, cfg, skip_invalid_eeg=True)
+
+
+def test_default_tgsp_lr_decodes_independent_synthetic_covariances(cfg):
+    cfg['classification']['pipelines'] = 'tgsp_lr'
+    test_real_pipelines_decode_independent_synthetic_covariances(cfg, 'TGSP', 'LR')

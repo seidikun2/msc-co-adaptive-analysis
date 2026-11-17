@@ -396,6 +396,15 @@ sem suavização. Em TFR, a baseline usa janelas totalmente contidas na atençã
 
 Implementação em `eeg_classification.py`, usando scikit-learn e pyRiemann:
 
+O padrão agora é **somente TGSP+LR** (`classification.pipelines: tgsp_lr`):
+Ledoit–Wolf → espaço tangente riemanniano → StandardScaler → regressão logística
+com `C=1`, classes balanceadas, solver lbfgs e até 2000 iterações. Não há busca
+ou seleção de modelos a partir do teste. Toda representação/escala é aprendida
+exclusivamente no treino. O mesmo modelo é usado nos diferentes protocolos.
+
+`classification.pipelines: all` preserva os seis modelos anteriores para
+compatibilidade, mas não produz o novo resumo TGSP+LR:
+
 | Representação | Classificadores |
 |---|---|
 | Ledoit–Wolf → TGSP (espaço tangente riemanniano) → StandardScaler | LDA, SVM linear, SVM RBF |
@@ -412,22 +421,22 @@ Uma futura busca deve usar CV **aninhada** apenas no treino.
    predições fora do fold (OOF), sem duplicar as tentativas ao combinar folds.
    A CV estratificada não mede extrapolação temporal e pode ser otimista sob
    deriva; `cv_scheme: forward` ativa TimeSeriesSplit e registra sua cobertura.
-2. **`session_im_frozen`**: os seis pipelines treinados no `im` da mesma sessão,
+2. **`session_im_frozen`**: TGSP+LR treinado no `im` da mesma sessão,
    avaliados separadamente em a, b, c, d sem atualização. É comparador diagnóstico;
    usar `im2` aqui NÃO altera o protocolo adaptativo abaixo.
-3. **`adaptive_protocol`**: TGSP+SVM inicializa **somente com IM da sessão 1**.
+3. **`adaptive_protocol`**: TGSP+LR inicializa **somente com IM da sessão 1**.
    O mesmo modelo prediz 1a e 1b, sem usar rótulos de nenhum deles no par.
    Depois incorpora ambos e refaz cumulativamente o treino antes de 1c/1d;
    incorpora c/d antes de 2a/2b e assim por diante até 6d.
    `adaptive_update_blocks: 2` controla a cadência (1 reproduz a atualização antiga
    por bloco). **IM2–IM6 nunca entram no treino desse experimento.**
 
-A SVM online padrão é RBF, configurável para linear. O teste ocorre antes da
+No modo legado, a SVM online é RBF ou linear. O teste ocorre antes da
 atualização; não há auto-rotulação nem teste usando treino do próprio bloco.
 Acurácia, acurácia balanceada, kappa, IC de Wilson da acurácia e predições por
 tentativa são exportados. Os ICs binomiais são descritivos e não corrigem
 dependência temporal. O campo `train_blocks` permite auditar cada treino.
-As matrizes de confusão comparam o mesmo TGSP+SVM entre os protocolos, sem somar
+As matrizes de confusão comparam o mesmo TGSP+LR entre os protocolos, sem somar
 predições de classificadores diferentes. `--eda-only` não calcula essas métricas;
 o relatório sinaliza isso no início. Para acurácias e comparações, remova a opção.
 
@@ -444,7 +453,84 @@ com uma pseudo-coadaptação. Não reconstitui decisões/feedback do modelo orig
 nem demonstra adaptação do participante. Sem marcadores do feedback ou rótulos
 de intenção verificados, não inferir esses efeitos a partir da acurácia.
 
-## 7. Futuras comparações de grupos
+## 7. Relatório único de todos os sujeitos
+
+Ao terminar `run`, o programa gera automaticamente **`results/report.html`**,
+com todos os sujeitos selecionados naquela execução, além dos relatórios
+individuais `results/SUJEITO/report.html`. Não incorpora pastas antigas de outros
+sujeitos por acaso. Use a saída básica, com o ambiente `bci` ativo:
+
+```bash
+git pull --ff-only origin main
+python run_analysis.py run --data "/home/seidi/Área de trabalho/Dados Seidi" --activity-window 0.5 3.5 --skip-empty --skip-missing-attention --skip-invalid-eeg
+```
+
+O resumo contém:
+
+- Cobertura por sujeito: arquivos processados, omitidos e ausentes; execuções
+  parciais continuam identificadas.
+- Acurácia e acurácia balanceada por sujeito para CV ME, CV MI, MI→online
+  congelado e adaptativo por pares; só TGSP+LR é treinado por padrão.
+- Curvas online de grupo e por sujeito, com lacunas visíveis. Médias de grupo
+  dão peso igual a sujeitos; dentro de cada sujeito, peso igual aos blocos.
+- Alfa/mu (8–13 Hz) e beta (13–30 Hz): média entre canais da ROI C3/Cz/C4 em
+  cada tentativa, já normalizada pela baseline individual como ERD/ERS (%).
+  ME, MI e online permanecem separados. Figuras mostram as classes da cue
+  separadas e médias móveis descritivas de 10 tentativas, sem suavizar os testes.
+- Um painel compacto recolhível por sujeito, com link para o relatório detalhado.
+
+Há dez testes exploratórios planejados: diferença CV MI−ME, diferença adaptativo−
+congelado, tendência de acurácia nos dois protocolos online e tendência ERD
+alfa/beta em ME, MI e online. As diferenças de acurácia usam apenas as mesmas
+sessões (ME/MI) ou os mesmos blocos online (congelado/adaptativo). Tendências de
+acurácia também usam blocos pareados, com mínimo de quatro blocos por sujeito.
+CV com cobertura OOF incompleta e sequências adaptativas explicitamente
+autorizadas com lacunas não entram na evidência primária do resumo; permanecem
+nos relatórios individuais.
+
+Para eletrofisiologia, estima-se uma inclinação por sujeito/tarefa/banda,
+ajustada para a classe da cue: mudança em pontos percentuais ao longo da sequência
+observada, normalizada de 0 a 1. São necessárias oito tentativas válidas, com
+pelo menos três de cada classe. Não se interpreta índice de tentativa como tempo
+físico nem se estima efeito causal de aprendizagem/coadaptação.
+Inclinação ERD positiva indica ERS maior ou ERD menos negativo, não necessariamente melhora.
+
+Os testes de grupo usam **um valor por sujeito**, não canais, folds ou tentativas
+como réplicas independentes. Troca de sinais bilateral: exata até 15 sujeitos,
+10.000 permutações com semente fixa acima disso. Exige simetria/permutabilidade
+dos efeitos e independência entre sujeitos. Com menos de três sujeitos válidos,
+o contraste fica **não testado**. Aplica-se Holm à família planejada de dez testes,
+inclusive quando alguns não têm dados. ICs de 95% usam bootstrap de sujeitos.
+Pontos nas curvas de grupo podem ter composição diferente por falta de dados;
+os testes de tendência usam as inclinações individuais. As análises são
+exploratórias, com possível viés de seleção por perdas/rejeições e montagem
+ainda provisória. Não comparam grupos clínicos automaticamente.
+
+Somente quatro arquivos adicionais ficam na raiz de `results`:
+
+| Arquivo | Conteúdo |
+|---|---|
+| `report.html` | Resumo completo com figuras incorporadas |
+| `figures.pdf` | Figuras do resumo, incluindo checagens por sujeito |
+| `summary-tables.zip` | Oito tabelas: acurácias por bloco/sujeito, pares, inclinações de acurácia, ERD por tentativa, inclinações ERD, testes e cobertura |
+| `summary-info.json` | Sujeitos incluídos, hashes das tabelas-fonte, modelo, ROI, semente e indicador de execução parcial |
+
+Para recriar apenas a apresentação/estatística a partir de resultados **já
+calculados com TGSP+LR**, sem reler os EEGs nem treinar:
+
+```bash
+python run_analysis.py summarize --output results --overwrite
+```
+
+`summarize` inclui as pastas de sujeitos com `tables.zip` na saída escolhida e
+recusa configurações científicas incompatíveis ou mistura real/sintética.
+Resultados antigos de SVM/LDA precisam ser recalculados com TGSP+LR.
+Sem `--overwrite`, resultados existentes são preservados. Não é necessário
+executar EDA e análise completa em sequência: o completo já inclui ambos.
+Se quiser só EDA, use `--eda-only --output results/eda`; seu resumo não terá
+acurácias, mas terá tendências eletrofisiológicas.
+
+## 8. Futuras comparações de grupos
 
 Todas as tabelas preservam `subject,group,session,block`; potência e predições
 preservam `trial_id`. `bandpower.csv` tem uma linha por tentativa × canal × banda,
@@ -467,7 +553,7 @@ with ZipFile("results/EG102/tables.zip") as z:
     power = pd.read_csv(z.open("bandpower.csv"))
 ```
 
-## 8. Testar sem os dados reais
+## 9. Testar sem os dados reais
 
 ```bash
 python -m pytest -q
