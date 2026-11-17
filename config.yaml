@@ -24,13 +24,12 @@ input:
   sfreq: null         # null = cabeçalho Time:...Hz, conferido pelos timestamps
 
 events:
-  # Aceita inteiros decimais ou hexadecimais. Confirme as ocorrências em `inspect`.
-  attention: []        # OBRIGATÓRIO: código real do momento de atenção
-  left: [769]         # OpenViBE/GDF_Left = 0x0301
-  right: [770]        # OpenViBE/GDF_Right = 0x0302
+  attention: [786]
+  left: [769]
+  right: [770]
   trial_start: [768, 32773]
-  task_start: []      # se existir um marcador separado da cue, informe aqui
-  rest_start: [32777] # OpenViBE RestStart = 0x8009; confirme no seu cenário
+  task_start: [781]
+  rest_start: [800, 32777]
   trial_stop: [800, 32774]
 
 preprocessing:
@@ -45,7 +44,7 @@ preprocessing:
   # Filtro causal, contínuo, com parâmetros fixos: não usa amostras futuras.
 
 epochs:
-  anchor: cue            # cue ou task_start; task_start exige marcador correspondente
+  anchor: task_start            # cue ou task_start; task_start exige marcador correspondente
   baseline_start_s: 0.2  # após a atenção; baseline termina antes da cue
   baseline_end_before_cue_s: 0.2
   min_baseline_s: 1.0
