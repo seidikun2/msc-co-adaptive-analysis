@@ -397,6 +397,11 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
     first_rest = frame.index[frame['Event Id'] == '32777'][0]
     frame.loc[first_rest, 'Event Date'] = str(float(frame.loc[first_rest, 'Event Date'])-.75)
     frame.to_csv(mixed, index=False)
+    # A readable recording with cues/motor events but no attention must be audited, not relabelled.
+    missing_attention = data / 'SYNTHETIC' / 'motor_me_SYNTHETIC_2.csv'
+    frame = pd.read_csv(missing_attention, dtype={'Event Id': str, 'Event Date': str})
+    frame.loc[frame['Event Id'] == '33024', ['Event Id', 'Event Date', 'Event Duration']] = np.nan
+    frame.to_csv(missing_attention, index=False)
     original = data / 'SYNTHETIC' / 'motor_mi_SYNTHETIC_1.csv'
     copy = data / 'copies' / original.name
     copy.parent.mkdir()
@@ -416,7 +421,8 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
              'inspect' if command == 'inspect' else 'run',
              '--config', str(synthetic / 'config.yaml'), '--data', str(data),
              '--output', str(output), '--exclude', 'motor_me_EMPTY_1.csv',
-             *(['--exclude', 'SYNTHETIC/motor_me_SYNTHETIC_3.csv'] if command == 'inspect' else ['--skip-empty']), *extra],
+             *(['--exclude', 'SYNTHETIC/motor_me_SYNTHETIC_3.csv'] if command == 'inspect'
+               else ['--skip-empty', '--skip-missing-attention']), *extra],
             cwd=project, env=environment, capture_output=True, text=True, timeout=180)
         assert result.returncode == 0, result.stdout + result.stderr
         if command == 'inspect':
@@ -432,10 +438,15 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
             with ZipFile(folder / 'tables.zip') as archive:
                 inventory = pd.read_csv(archive.open('inventory.csv'))
                 assert inventory.loc[inventory.status == 'skipped_empty', 'block'].tolist() == ['me']
+                omitted = inventory.loc[inventory.status == 'skipped_missing_attention']
+                assert omitted.session.tolist() == [2] and omitted.n_trials.isna().all()
                 trials = pd.read_csv(archive.open('trials.csv'))
+                events = pd.read_csv(archive.open('events.csv'))
+                unmatched = events.loc[(events.session == 2) & (events.block == 'me')]
+                assert len(unmatched) > 0 and unmatched.trial_id.isna().all()
                 scores = pd.read_csv(archive.open('scores.csv'))
                 powers = pd.read_csv(archive.open('bandpower.csv'))
-                assert len(trials) == 96
+                assert len(trials) == 88
                 online = trials.block.str.startswith('online_')
                 assert trials.loc[online, 'status'].eq('accepted').all()
                 if command == 'eda_short':
@@ -744,3 +755,64 @@ def test_tfr_curves_are_aligned_below_each_map_and_include_cz(cfg):
                 assert abs(curve.get_position().x0-map_ax.get_position().x0) < .001
                 assert abs(curve.get_position().x1-map_ax.get_position().x1) < .001
     plt.close(fig)
+
+
+def test_missing_attention_error_reports_path_expected_and_observed_codes(cfg):
+    from eeg_processing import MissingAttentionError
+    rec = recording(cfg)
+    rec.events = rec.events.loc[rec.events.code != 33024].copy()
+    with pytest.raises(MissingAttentionError) as error:
+        trial_table(rec, cfg)
+    text = str(error.value)
+    assert str(rec.path) in text and '33024' in text
+    assert '769' in text and '770' in text and '33027' in text
+
+
+def test_missing_attention_is_not_inferred_from_baseline_or_cues(cfg):
+    from eeg_processing import MissingAttentionError
+    rec = recording(cfg)
+    rec.events.loc[rec.events.code == 33024, 'code'] = 32775
+    with pytest.raises(MissingAttentionError):
+        prepare_block(rec, cfg, dict(subject='SYNTHETIC', group='demo', session=1, block='me'))
+
+
+def test_missing_attention_omission_keeps_markers_and_stops_adaptive_gap(tmp_path, cfg, monkeypatch):
+    import json
+    from zipfile import ZipFile
+    import run_analysis
+    from eeg_processing import MissingAttentionError
+    rec = recording(cfg)
+    for name, omit_attention in [('motor_mi_TEST_1.csv', False),
+                                  ('motor_mi_TEST_online_1a.csv', True),
+                                  ('motor_mi_TEST_online_1b.csv', False)]:
+        frame = pd.DataFrame(rec.signal.T, columns=cfg['input']['channels'])
+        frame.insert(0, 'Time:128Hz', rec.times)
+        frame['Event Id'] = ''
+        frame['Event Date'] = ''
+        for event in rec.events.itertuples():
+            if omit_attention and event.code == 33024:
+                continue
+            frame.loc[round(event.time_s*rec.sfreq), ['Event Id', 'Event Date']] = [str(event.code), str(event.time_s)]
+        frame.to_csv(tmp_path / name, index=False)
+    cfg['paths'].update(data=str(tmp_path), manifest=None, output=str(tmp_path / 'results'))
+    monkeypatch.setattr(run_analysis, '_draw_block', lambda *args: None)
+    # Default remains fatal, including when skip_empty alone is set.
+    with pytest.raises(MissingAttentionError):
+        run_analysis.analyze_subject(discover(cfg), cfg, skip_empty=True)
+    run_analysis.analyze_subject(discover(cfg), cfg, skip_missing_attention=True)
+    target = tmp_path / 'results' / 'TEST'
+    assert json.loads((target / 'run-info.json').read_text())['partial'] is True
+    with ZipFile(target / 'tables.zip') as z:
+        inventory = pd.read_csv(z.open('inventory.csv'))
+        events = pd.read_csv(z.open('events.csv'))
+        trials = pd.read_csv(z.open('trials.csv'))
+        scores = pd.read_csv(z.open('scores.csv'))
+    omitted = inventory.loc[inventory.status == 'skipped_missing_attention'].iloc[0]
+    assert omitted.block == 'online_a' and pd.isna(omitted.n_trials)
+    assert json.loads(omitted.event_counts)['769'] == 3
+    assert not trials.block.eq('online_a').any()
+    assert len(events.loc[events.block == 'online_a']) == 18
+    assert events.loc[events.block == 'online_a', 'trial_id'].isna().all()
+    adaptive = scores.loc[scores.experiment == 'adaptive_protocol']
+    assert adaptive.status.tolist() == ['skipped']
+    assert 'online_a' in adaptive.iloc[0].reason

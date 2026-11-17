@@ -18,7 +18,7 @@ import pandas as pd
 import yaml
 
 from eeg_io import BLOCKS, EmptyRecordingError, discover, inspect_folder, load_config, read_recording
-from eeg_processing import event_table, prepare_block, spectral_summary, validate_config
+from eeg_processing import MissingAttentionError, event_table, prepare_block, spectral_summary, validate_config
 from eeg_classification import classify_subject
 
 
@@ -124,7 +124,7 @@ def _draw_block(report, rec, raw, filtered, block, trials, events, summary, powe
                       "Posições artificiais não permitem interpretação anatômica.")
 
 
-def analyze_subject(table, cfg, overwrite=False, skip_empty=False):
+def analyze_subject(table, cfg, overwrite=False, skip_empty=False, skip_missing_attention=False):
     from eeg_figures import Report, classification_figures
     subject = str(table.subject.iloc[0])
     root = Path(cfg["paths"]["output"])
@@ -161,7 +161,24 @@ def analyze_subject(table, cfg, overwrite=False, skip_empty=False):
                                       n_accepted=0, n_eda_accepted=0, duplicate_paths=row.duplicate_paths,
                                       duplicate_entries=row.duplicate_entries, duplicate_sha256=row.duplicate_sha256))
                 continue
-            block, trials, raw, filtered, qc = prepare_block(rec, cfg, meta)
+            try:
+                block, trials, raw, filtered, qc = prepare_block(rec, cfg, meta)
+            except MissingAttentionError as exc:
+                if not skip_missing_attention:
+                    raise
+                message = f"EXECUÇÃO PARCIAL — gravação sem atenção omitida: {exc}"
+                print(message, flush=True)
+                report.text(message)
+                inventory.append(dict(**meta, path=row.path, sha256=_sha256(row.path),
+                                      status="skipped_missing_attention", error=str(exc), n_trials=np.nan,
+                                      n_accepted=0, n_eda_accepted=0,
+                                      sfreq=rec.sfreq, n_channels=len(rec.channels),
+                                      duration_s=len(rec.times)/rec.sfreq,
+                                      event_counts=json.dumps({str(int(k)): int(v) for k, v in rec.events.code.value_counts().items()}),
+                                      duplicate_paths=row.duplicate_paths, duplicate_entries=row.duplicate_entries,
+                                      duplicate_sha256=row.duplicate_sha256))
+                all_events.append(event_table(rec, cfg, meta, pd.DataFrame()))
+                continue
             print(f"  Classificação: {len(block.X)}/{len(trials)}; "
                   f"EDA: {len(block.eda_trials)}/{len(trials)} tentativas aceitas", flush=True)
             reasons = trials.loc[trials.status == "excluded", "reason"].value_counts().to_dict()
@@ -196,8 +213,8 @@ def analyze_subject(table, cfg, overwrite=False, skip_empty=False):
             if draw:
                 _draw_block(report, rec, raw, filtered, eda_block, trials, events, summary, powers, cfg)
             blocks.append(block)
-        if any(r["status"] == "skipped_empty" for r in inventory):
-            report.parts.insert(1, "<p><strong>EXECUÇÃO PARCIAL: há CSVs vazios omitidos. "
+        if any(r["status"].startswith("skipped_") for r in inventory):
+            report.parts.insert(1, "<p><strong>EXECUÇÃO PARCIAL: há gravações omitidas. "
                                 "Confira os caminhos e motivos no inventário.</strong></p>")
         present = {(r["session"], r["block"]) for r in inventory}
         missing = [dict(subject=subject, group=table.group.iloc[0], session=s, block=b, status="missing")
@@ -209,7 +226,7 @@ def analyze_subject(table, cfg, overwrite=False, skip_empty=False):
         with threadpool_limits(limits=cfg["classification"].get("blas_threads", 1)):
             scores, predictions = classify_subject(blocks, cfg) if blocks else (pd.DataFrame(), pd.DataFrame())
         if not blocks:
-            report.text("Nenhuma gravação utilizável neste sujeito; todos os arquivos foram omitidos como vazios. "
+            report.text("Nenhuma gravação utilizável neste sujeito; todos os arquivos foram omitidos. "
                         "Não há medidas EDA nem resultados de classificação.")
         report.text("CV offline: "+cfg["classification"]["cv_scheme"]+". TGSP = covariância Ledoit–Wolf → "
                     "espaço tangente riemanniano; CSP usa as mesmas covariâncias regularizadas. "
@@ -254,7 +271,7 @@ def analyze_subject(table, cfg, overwrite=False, skip_empty=False):
         public_cfg = {k: v for k, v in cfg.items() if k != "_config_dir"}
         (work / "config-used.yaml").write_text(yaml.safe_dump(public_cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
         provenance = dict(python=sys.version, command=sys.argv, synthetic=bool(cfg.get("_synthetic")),
-                          partial=any(r["status"] == "skipped_empty" for r in inventory),
+                          partial=any(r["status"].startswith("skipped_") for r in inventory),
                           tfr_tests=tfr_tests,
                           versions={name: version(name) for name in ("numpy", "scipy", "pandas", "matplotlib",
                                      "scikit-learn", "mne", "pyriemann", "PyYAML")},
@@ -338,12 +355,14 @@ def main():
     parser.add_argument("--eda-only", action="store_true", help="Pular classificação.")
     parser.add_argument("--skip-empty", action="store_true",
                         help="Em run, omitir CSVs vazios com registro de execução parcial; outros erros continuam fatais.")
+    parser.add_argument("--skip-missing-attention", action="store_true",
+                        help="Em run, omitir gravações sem o código de atenção, preservando marcadores e registro de execução parcial.")
     parser.add_argument("--activity-window", type=float, nargs=2, metavar=("START", "STOP"),
                         help="Janela EDA fixa em segundos após o anchor; não altera os 2 s da classificação.")
     parser.add_argument("--overwrite", action="store_true", help="Substituir somente os arquivos de saída gerados.")
     args = parser.parse_args()
-    if args.skip_empty and args.command != "run":
-        raise ValueError("--skip-empty é exclusivo de run; inspect/diagnose sempre registram os erros.")
+    if (args.skip_empty or args.skip_missing_attention) and args.command != "run":
+        raise ValueError("Opções --skip-* são exclusivas de run; inspect/diagnose sempre registram os erros.")
     cfg = load_config(args.config)
     if args.activity_window is not None:
         cfg["epochs"]["activity_s"] = args.activity_window
@@ -382,7 +401,7 @@ def main():
             diagnose(table, cfg, Path(cfg["paths"]["output"]) / "diagnostics.json", args.overwrite)
         else:
             for _, subject_table in table.groupby("subject", sort=True):
-                analyze_subject(subject_table, cfg, args.overwrite, args.skip_empty)
+                analyze_subject(subject_table, cfg, args.overwrite, args.skip_empty, args.skip_missing_attention)
 
 
 if __name__ == "__main__":

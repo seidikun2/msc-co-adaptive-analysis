@@ -202,6 +202,19 @@ caminho, hash e motivo. `run-info.json` marca `partial: true`. Isso não recuper
 os dados: reexporte os arquivos para uma análise completa. IM1 vazio impede o
 protocolo adaptativo; um online vazio preserva a regra de parada na primeira lacuna.
 
+Uma gravação pode ter amostras, cues e início motor, mas não conter o código de
+atenção configurado. O erro inclui caminho, códigos esperados e contagens dos
+códigos presentes. Cue, início motor e baseline geral não substituem a atenção
+individual; confira a exportação e o protocolo antes de mudar `events.attention`.
+Para continuar explicitamente sem esses blocos, acrescente
+`--skip-missing-attention`: o relatório será parcial, com inventário
+`status=skipped_missing_attention`, hash, motivo e códigos presentes. A contagem
+de tentativas fica desconhecida (vazia), não é estimada a partir das cues.
+Os marcadores originais são preservados em `events.csv` sem associação inventada
+a tentativas. Essa opção é separada de `--skip-empty` e não omite outros erros.
+Blocos omitidos não entram no treino; ausência de IM1 ou de um online mantém as
+mesmas restrições do protocolo adaptativo.
+
 Exemplo de EDA com os arquivos utilizáveis e janela fixa adequada às tarefas curtas:
 
 ```bash

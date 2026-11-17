@@ -10,6 +10,10 @@ from scipy import signal, stats
 from eeg_io import Recording, code
 
 
+class MissingAttentionError(ValueError):
+    """Gravação legível, mas sem baseline individual identificável."""
+
+
 @dataclass
 class EpochBlock:
     meta: dict
@@ -131,7 +135,11 @@ def trial_table(rec, cfg):
     ev = rec.events
     attention = np.unique(ev.loc[ev.code.isin(codes["attention"]), "time_s"].to_numpy())
     if not len(attention):
-        raise ValueError("Nenhuma atenção encontrada; confira events.attention.")
+        counts = {str(int(k)): int(v) for k, v in ev.code.value_counts().sort_index().items()}
+        raise MissingAttentionError(f"Nenhuma atenção encontrada em {rec.path}; "
+                                    f"events.attention={sorted(codes['attention'])}; "
+                                    f"códigos presentes (código: contagem)={counts}. "
+                                    "Confira os marcadores/exportação; baseline geral e cue não substituem atenção.")
     rows = []
     for i, start in enumerate(attention):
         end = attention[i+1] if i+1 < len(attention) else rec.times[-1]+1/rec.sfreq
@@ -355,6 +363,9 @@ def event_table(rec, cfg, meta, trials):
     roles = event_codes(cfg)
     table["event_name"] = table.code.map(
         lambda x: "/".join(k for k, v in roles.items() if x in v) or f"unmapped_0x{x:04X}")
+    if trials.empty:
+        return table.assign(**meta, trial_id="", from_attention_s=np.nan,
+                            from_cue_s=np.nan, from_task_start_s=np.nan)
     index = np.searchsorted(trials.attention_s.to_numpy(), table.time_s, side="right")-1
     # Um TrialStart antes da atenção pertence à tentativa que vai começar.
     for j, row in enumerate(table.itertuples()):
