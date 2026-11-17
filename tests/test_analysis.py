@@ -87,7 +87,9 @@ def test_short_baselines_and_rest_overlap_are_excluded(cfg):
     assert (table.loc[table.label == "left", "reason"] == "short_attention_baseline").all()
     rec = recording(cfg)
     rec.events.loc[rec.events.code == 32777, "time_s"] -= 3
-    assert (trial_table(rec, cfg).reason == "activity_overlaps_rest_or_next_trial").all()
+    table = trial_table(rec, cfg)
+    assert (table.reason == "classification_overlaps_rest_or_next_trial").all()
+    assert (table.eda_reason == "activity_overlaps_rest_or_next_trial").all()
 
 
 def test_filters_do_not_use_future_samples(cfg):
@@ -382,22 +384,36 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
     synthetic = tmp_path / 'synthetic'
     make_demo(synthetic, load_config(project / 'config.yaml'))
     data = synthetic / 'data'
+    # Online tasks last 3.75 s: the classifier fits, the default EDA window does not.
+    for path in data.rglob('*online*.csv'):
+        frame = pd.read_csv(path, dtype={'Event Id': str, 'Event Date': str})
+        mask = frame['Event Id'] == '32777'
+        frame.loc[mask, 'Event Date'] = (frame.loc[mask, 'Event Date'].astype(float)-.75).astype(str)
+        frame.to_csv(path, index=False)
+    # The first IM report has mixed eligibility: seven EDA trials, eight classifier trials.
+    mixed = data / 'SYNTHETIC' / 'motor_mi_SYNTHETIC_1.csv'
+    frame = pd.read_csv(mixed, dtype={'Event Id': str, 'Event Date': str})
+    first_rest = frame.index[frame['Event Id'] == '32777'][0]
+    frame.loc[first_rest, 'Event Date'] = str(float(frame.loc[first_rest, 'Event Date'])-.75)
+    frame.to_csv(mixed, index=False)
     original = data / 'SYNTHETIC' / 'motor_mi_SYNTHETIC_1.csv'
     copy = data / 'copies' / original.name
     copy.parent.mkdir()
     shutil.copyfile(original, copy)
     for name in ('Organizacao_experimentos.csv', 'motor_16ch.csv'):
         (data / name).write_text('configuration,not EEG\n1,2\n')
+    (data / 'motor_me_EMPTY_1.csv').write_text('')
     environment = dict(os.environ, MPLBACKEND='Agg',
                        MPLCONFIGDIR=str(tmp_path / 'mpl'),
                        OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1')
-    for command, extra in (('inspect', []), ('eda', ['--eda-only']), ('full', [])):
+    for command, extra in (('inspect', []), ('eda', ['--eda-only']), ('full', []),
+                           ('eda_short', ['--eda-only', '--activity-window', '.5', '3.5'])):
         output = tmp_path / command
         result = subprocess.run(
             [sys.executable, str(project / 'run_analysis.py'),
              'inspect' if command == 'inspect' else 'run',
              '--config', str(synthetic / 'config.yaml'), '--data', str(data),
-             '--output', str(output), *extra],
+             '--output', str(output), '--exclude', 'motor_me_EMPTY_1.csv', *extra],
             cwd=project, env=environment, capture_output=True, text=True, timeout=180)
         assert result.returncode == 0, result.stdout + result.stderr
         if command == 'inspect':
@@ -412,12 +428,26 @@ def test_cli_without_manifest_with_auxiliary_csvs_and_identical_copy(tmp_path):
                 inventory = pd.read_csv(archive.open('inventory.csv'))
                 trials = pd.read_csv(archive.open('trials.csv'))
                 scores = pd.read_csv(archive.open('scores.csv'))
+                powers = pd.read_csv(archive.open('bandpower.csv'))
                 assert len(trials) == 96
+                online = trials.block.str.startswith('online_')
+                assert trials.loc[online, 'status'].eq('accepted').all()
+                if command == 'eda_short':
+                    assert trials.loc[online, 'eda_status'].eq('accepted').all()
+                    assert powers.block.str.startswith('online_').any()
+                else:
+                    assert trials.loc[online, 'eda_status'].eq('excluded').all()
+                    assert not powers.block.str.startswith('online_').any()
                 if command == 'full':
                     assert len(scores) > 0 and set(scores.status) == {'ok'}
+                    adaptive = scores.loc[scores.experiment == 'adaptive_protocol']
+                    assert len(adaptive) == 8 and adaptive.n_test.eq(8).all()
                 else:
                     assert scores.empty
         block = inventory.loc[(inventory.session == 1) & (inventory.block == 'im')].iloc[0]
+        if command != 'inspect':
+            assert block.n_accepted == 8
+            assert block.n_eda_accepted == (8 if command == 'eda_short' else 7)
         assert json.loads(block.duplicate_paths) == [str(copy)]
         assert len(block.duplicate_sha256) == 64
 
@@ -496,3 +526,56 @@ def test_diagnostics_preserve_rejection_reasons_and_continue_after_empty_file(tm
     with pytest.raises(ValueError, match='já existe'):
         diagnose(discover(cfg), cfg, destination)
     assert destination.read_bytes() == previous
+
+
+@pytest.mark.parametrize('duration', [3.75, 3.7506631061])
+def test_short_motor_task_keeps_exact_two_second_classifier_epoch(cfg, duration):
+    rec = recording(cfg, n_trials=2)
+    rec.times += 27
+    rec.events['time_s'] += 27
+    attention = rec.events.loc[rec.events.code == 33024, 'time_s'].to_numpy()
+    for i, start in enumerate(attention):
+        rec.events.loc[i*4+1, 'time_s'] = start+3
+        rec.events.loc[i*4+2, 'time_s'] = start+4.25
+        rec.events.loc[i*4+3, 'time_s'] = start+4.25+duration
+    block, trials, _, filtered, _ = prepare_block(
+        rec, cfg, dict(subject='SYNTHETIC', group='demo', session=1, block='online_a'))
+    assert block.X.shape == (2, 16, 256)
+    assert block.trials.label.tolist() == ['left', 'right']
+    assert (trials.status == 'accepted').all()
+    assert (trials.eda_status == 'excluded').all()
+    assert set(trials.eda_reason) == {'activity_overlaps_rest_or_next_trial'}
+    assert len(block.eda_trials) == 0
+    summary, powers = spectral_summary(rec, filtered, block, cfg, with_tfr=True)
+    assert summary is None and powers.empty
+    # An explicit fixed shorter EDA window fits; no automatic truncation is used.
+    cfg['epochs']['activity_s'] = [.5, 3.5]
+    shorter, shorter_trials, _, filtered, _ = prepare_block(rec, cfg, block.meta)
+    np.testing.assert_array_equal(shorter.X, block.X)
+    assert (shorter_trials.eda_status == 'accepted').all()
+    summary, powers = spectral_summary(rec, filtered, shorter, cfg, with_tfr=True)
+    assert summary is not None and set(powers.trial_id) == set(shorter.trials.trial_id)
+
+
+def test_eda_can_be_valid_when_classification_window_does_not_fit(cfg):
+    rec = recording(cfg)
+    cfg['epochs']['activity_s'] = [.5, 1.5]
+    rec.events.loc[rec.events.code == 32777, 'time_s'] -= 2.25
+    block, trials, _, filtered, _ = prepare_block(
+        rec, cfg, dict(subject='SYNTHETIC', group='demo', session=1, block='im'))
+    assert len(block.X) == 0 and block.trials.empty
+    assert set(trials.reason) == {'classification_overlaps_rest_or_next_trial'}
+    assert len(block.eda_trials) == 6
+    summary, powers = spectral_summary(rec, filtered, block, cfg)
+    assert summary is not None and len(powers) == 6*16*2
+
+
+def test_artifact_after_classifier_window_does_not_reject_classifier(cfg):
+    rec = recording(cfg, n_trials=2)
+    for start in rec.events.loc[rec.events.code == 33024, 'time_s']:
+        rec.signal[0, (rec.times >= start+5.6) & (rec.times < start+6)] += 10000
+    block, trials, *_ = prepare_block(
+        rec, cfg, dict(subject='SYNTHETIC', group='demo', session=1, block='im'))
+    assert len(block.X) == 2
+    assert block.eda_trials.empty
+    assert set(trials.eda_reason) == {'high_peak_to_peak'}

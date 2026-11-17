@@ -51,7 +51,7 @@ epochs:
   baseline_start_s: 0.2  # após a atenção; baseline termina antes da cue
   baseline_end_before_cue_s: 0.2
   min_baseline_s: 1.0
-  activity_s: [0.5, 4.5] # em relação ao anchor
+  activity_s: [0.5, 4.5] # EDA após o anchor; independente da classificação; --activity-window sobrescreve
   classification_s: [0.5, 2.5] # UMA janela de exatamente 2 s por tentativa
 
 spectral:

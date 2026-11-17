@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import hashlib
 from importlib.metadata import version
 import json
@@ -50,11 +51,14 @@ def diagnose(table, cfg, destination, overwrite=False):
             block, trials, *_ = prepare_block(rec, cfg, dict(
                 subject=row.subject, group=row.group, session=int(row.session), block=row.block))
             reasons = trials.loc[trials.status == "excluded", "reason"].value_counts().to_dict()
+            eda_reasons = trials.loc[trials.eda_status == "excluded", "eda_reason"].value_counts().to_dict()
             item.update(status="ok", n_trials=len(trials), n_accepted=len(block.X),
-                        rejection_reasons=reasons,
+                        rejection_reasons=reasons, n_eda_accepted=len(block.eda_trials),
+                        eda_rejection_reasons=eda_reasons,
                         trials=json.loads(trials.to_json(orient="records", double_precision=10)))
             print(f"{row.subject} · s{row.session}/{row.block}: "
-                  f"{len(block.X)}/{len(trials)} aceitas; exclusões: {reasons}", flush=True)
+                  f"classificação {len(block.X)}/{len(trials)}; exclusões: {reasons}; "
+                  f"EDA {len(block.eda_trials)}/{len(trials)}; exclusões EDA: {eda_reasons}", flush=True)
         except (ValueError, OSError, KeyError) as exc:
             item.update(status="error", error=str(exc))
             print(f"{row.path}: ERRO: {exc}", flush=True)
@@ -70,8 +74,10 @@ def _draw_block(report, rec, raw, filtered, block, trials, events, summary, powe
     from eeg_figures import (raw_plot, timing_plot, spectral_plot, tfr_plot,
                              erd_curve_plot, topomap_plot)
     title = f"Sessão {block.meta['session']} · {block.meta['block']}"
-    report.text(f"{title}: {len(block.X)}/{len(trials)} tentativas aceitas. "
-                f"Exclusões: {trials.loc[trials.status == 'excluded', 'reason'].value_counts().to_dict()}")
+    report.text(f"{title}: classificação {len(block.X)}/{len(trials)}; "
+                f"EDA {len(block.trials)}/{len(trials)} tentativas aceitas. "
+                f"Exclusões classificação: {trials.loc[trials.status == 'excluded', 'reason'].value_counts().to_dict()}. "
+                f"Exclusões EDA: {trials.loc[trials.eda_status == 'excluded', 'eda_reason'].value_counts().to_dict()}")
     report.figure(raw_plot(rec, raw, filtered, block, trials, cfg), title+" · EEG bruto e pré-processado",
                   "Mesma janela, canais e escala. Mediana removida por canal somente para exibição. "
                   "Filtro IIR causal contínuo e referência configurada; não há ICA nem correção de EOG. "
@@ -85,7 +91,8 @@ def _draw_block(report, rec, raw, filtered, block, trials, events, summary, powe
                   "vem exclusivamente da CUE, nunca do início motor. Sem marcador motor, a referência não é desenhada. "
                   "Todas as tentativas e marcações permanecem nas tabelas do ZIP.")
     if summary is None:
-        report.text("Nenhuma tentativa aceita: espectros e ERD/ERS não calculados para este bloco.")
+        report.text("Nenhuma tentativa aceita para a janela EDA configurada: espectros e ERD/ERS "
+                    "não calculados para este bloco. Tentativas válidas para classificação são preservadas.")
         return
     report.figure(spectral_plot(summary, block, cfg), title+" · Espectro por classe",
                   "Welch por tentativa; média em potência linear antes de converter para dB. "
@@ -128,21 +135,27 @@ def analyze_subject(table, cfg, overwrite=False):
                     "Seleção de figuras: "+cfg["figures"]["selection"]+"; métricas calculadas em todos os arquivos disponíveis.")
         report.text("Baseline: atenção + início configurado até cue − margem configurada. "
                     "Tentativas com baseline curta, ordem inválida, janela invadindo pausa ou artefatos "
-                    "são excluídas com motivo registrado. Classificação: uma janela de 2 s por tentativa. "
+                    "são excluídas com motivo registrado para cada finalidade separadamente. "
+                    "Classificação: uma janela de 2 s por tentativa. "
                     "ERD é mudança relativa de potência; não é medida direta de ativação cortical.")
         for row in table.itertuples():
             meta = dict(subject=subject, group=row.group, session=int(row.session), block=row.block)
             print(f"{subject} · sessão {row.session} · {row.block}: lendo {Path(row.path).name}", flush=True)
             rec = read_recording(row.path, cfg)
             block, trials, raw, filtered, qc = prepare_block(rec, cfg, meta)
-            print(f"  {len(block.X)}/{len(trials)} tentativas aceitas", flush=True)
+            print(f"  Classificação: {len(block.X)}/{len(trials)}; "
+                  f"EDA: {len(block.eda_trials)}/{len(trials)} tentativas aceitas", flush=True)
             reasons = trials.loc[trials.status == "excluded", "reason"].value_counts().to_dict()
             if reasons:
-                print(f"  Motivos de exclusão: {reasons}", flush=True)
+                print(f"  Motivos de exclusão classificação: {reasons}", flush=True)
+            eda_reasons = trials.loc[trials.eda_status == "excluded", "eda_reason"].value_counts().to_dict()
+            if eda_reasons:
+                print(f"  Motivos de exclusão EDA: {eda_reasons}", flush=True)
             kind = "online" if row.block.startswith("online") else row.block
             draw = cfg["figures"]["selection"] == "all" or kind not in selected
             selected.add(kind)
-            summary, powers = spectral_summary(rec, filtered, block, cfg, with_tfr=draw)
+            eda_block = replace(block, trials=block.eda_trials)
+            summary, powers = spectral_summary(rec, filtered, eda_block, cfg, with_tfr=draw)
             events = event_table(rec, cfg, meta, trials)
             qc["position_confirmed"] = cfg["figures"]["montage_confirmed"]
             original = cfg["input"].get("channels") or rec.channels
@@ -157,9 +170,10 @@ def analyze_subject(table, cfg, overwrite=False):
                                   duplicate_entries=row.duplicate_entries,
                                   duplicate_sha256=row.duplicate_sha256,
                                   n_channels=len(block.channels), n_trials=len(trials), n_accepted=len(block.X),
+                                  n_eda_accepted=len(block.eda_trials),
                                   duration_s=len(rec.times)/rec.sfreq, status="available"))
             if draw:
-                _draw_block(report, rec, raw, filtered, block, trials, events, summary, powers, cfg)
+                _draw_block(report, rec, raw, filtered, eda_block, trials, events, summary, powers, cfg)
             blocks.append(block)
         present = {(r["session"], r["block"]) for r in inventory}
         missing = [dict(subject=subject, group=table.group.iloc[0], session=s, block=b, status="missing")
@@ -281,11 +295,22 @@ def main():
     parser.add_argument("--data", help="Sobrescreve paths.data; aceita árvore com pastas de sujeitos.")
     parser.add_argument("--output", help="Sobrescreve paths.output; para demo é a pasta da demonstração.")
     parser.add_argument("--manifest", help="CSV explícito, opcional quando os nomes seguem a convenção.")
+    parser.add_argument("--exclude", action="append", default=[], metavar="GLOB",
+                        help="Acrescentar exclusão à busca automática; pode repetir. Nenhum arquivo é apagado.")
     parser.add_argument("--subject", help="Processar somente este sujeito.")
     parser.add_argument("--eda-only", action="store_true", help="Pular classificação.")
+    parser.add_argument("--activity-window", type=float, nargs=2, metavar=("START", "STOP"),
+                        help="Janela EDA fixa em segundos após o anchor; não altera os 2 s da classificação.")
     parser.add_argument("--overwrite", action="store_true", help="Substituir somente os arquivos de saída gerados.")
     args = parser.parse_args()
     cfg = load_config(args.config)
+    if args.activity_window is not None:
+        cfg["epochs"]["activity_s"] = args.activity_window
+    if args.exclude:
+        patterns = cfg["input"].get("exclude_globs") or []
+        if not isinstance(patterns, list):
+            raise ValueError("input.exclude_globs deve ser uma lista de nomes/padrões.")
+        cfg["input"]["exclude_globs"] = patterns + args.exclude
     for name in ("data", "output", "manifest"):
         if getattr(args, name):
             cfg["paths"][name] = str(Path(getattr(args, name)).resolve())

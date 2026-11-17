@@ -71,6 +71,10 @@ arquivos/pastas, configure no bloco `input` de `config.yaml`:
 exclude_globs: [backup, 'rascunhos/*', '*_config.csv']
 ```
 
+Também é possível acrescentar exclusões sem editar YAML, repetindo `--exclude`:
+`python run_analysis.py run --data /caminho/para/dados --exclude backup --exclude '*_config.csv'`.
+O padrão não apaga arquivos; as exclusões usadas ficam em `config-used.yaml`.
+
 Cada padrão corresponde ao nome ou ao caminho relativo à raiz `--data`, com `/`
 como separador. Uma pasta correspondente exclui toda a sua árvore. CSVs restantes
 fora da convenção continuam sendo sinalizados; não são descartados silenciosamente.
@@ -207,10 +211,14 @@ somente os trechos necessários, anonimizados.
 
 `missing_task_start` indica ausência do marcador motor configurado dentro da
 tentativa; `short_attention_baseline`, atenção pré-cue insuficiente;
-`activity_overlaps_rest_or_next_trial`, janela que invade pausa/próxima tentativa.
+`activity_overlaps_rest_or_next_trial`, janela EDA que invade pausa/próxima tentativa;
+`classification_overlaps_rest_or_next_trial`, janela de classificação que invade esse limite.
 Esses motivos exigem conferir o protocolo e os marcadores reais. `0/N` sozinho
 não identifica a causa. CSV vazio/sem cabeçalho exige conferir ou refazer a
 exportação original; não é interpretado como um bloco sem tentativas.
+Se optar por uma execução parcial sem um arquivo sabidamente vazio, exclua-o
+explicitamente com `--exclude 'AL106/motor_me_AL106_3.csv'`. O bloco ficará
+ausente no inventário do relatório, e a exclusão constará da configuração usada.
 
 Cada sujeito recebe somente cinco arquivos em `results/EG102/`:
 
@@ -268,8 +276,28 @@ O mínimo padrão é 1 s; ajuste as margens/janelas se o protocolo tiver atenç�
 mais curta. Não encurtar automaticamente baselines ruins. Atividade: 0,5–4,5 s
 após o anchor; classificação: **0,5–2,5 s**, uma janela única de **2 s**. As janelas
 não podem invadir a pausa ou a próxima tentativa. Se forem curtas/inválidas, o
-motivo fica em `trials.csv`. A rejeição por artefato vale para baseline, atividade
-e janela de classificação. Não há ICA, correção de EOG ou detecção automática de
+motivo fica em `trials.csv`. `status/reason` se referem à classificação;
+`eda_status/eda_reason`, à atividade usada no EDA. A janela EDA inválida não exclui
+uma janela de classificação válida, e vice-versa. A rejeição por artefato verifica
+baseline + janela de cada finalidade separadamente, sem usar a atividade fora dos
+2 s para rejeitar a classificação. `n_accepted` no inventário conta classificação;
+`n_eda_accepted` conta EDA. Espectros/ERD usam somente tentativas aceitas para EDA;
+treinos/predições usam somente as aceitas para classificação.
+
+Os tempos reais fornecidos mostram tarefas de cerca de 3,75 s em blocos online e
+em alguns offline: a classificação de 0,5–2,5 s cabe, mas o EDA padrão de 0,5–4,5 s
+não. Para escolher explicitamente uma janela EDA fixa de 3 s, comum aos blocos:
+
+```bash
+python run_analysis.py run --data "/home/seidi/Área de trabalho/Dados Seidi" --eda-only --activity-window 0.5 3.5 --output results/eda-3s
+```
+
+`--activity-window` sobrescreve apenas `epochs.activity_s`; o valor efetivo é salvo
+no relatório. Não há truncamento automático, e tentativas ainda mais curtas são
+rejeitadas para EDA. A classificação permanece exatamente 2 s. Não compare
+potências agregadas de relatórios com janelas diferentes como se fossem a mesma medida.
+
+Não há ICA, correção de EOG ou detecção automática de
 canais ruins; liste `bad_channels` antes de refazer a referência.
 
 Os filtros são IIR **causais e contínuos**, sem usar amostras futuras; introduzem

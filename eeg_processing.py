@@ -1,7 +1,7 @@
 """Tentativas, filtros causais e medidas espectrais com baseline por tentativa."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -17,6 +17,7 @@ class EpochBlock:
     sfreq: float
     X: np.ndarray                 # tentativas × canais × amostras (janela única de 2 s)
     trials: pd.DataFrame          # somente tentativas aceitas, na mesma ordem de X
+    eda_trials: pd.DataFrame | None = None  # aceitas para a janela de atividade, independentemente de X
 
 
 def event_codes(cfg):
@@ -159,11 +160,17 @@ def trial_table(rec, cfg):
             row["reason"] = "short_attention_baseline"
         elif row["baseline_start_s"] < rec.times[0]+cfg["preprocessing"]["settling_s"]:
             row["reason"] = "filter_initial_transient"
-        elif anchor + max(ep["activity_s"][1], ep["classification_s"][1]) > row["end_s"]+1e-8:
-            row["reason"] = "activity_overlaps_rest_or_next_trial"
+        elif anchor + ep["classification_s"][1] > row["end_s"]+1e-8:
+            row["reason"] = "classification_overlaps_rest_or_next_trial"
         else:
             row["status"] = "candidate"
         rows.append(row)
+    for row in rows:
+        common = row["reason"] if row["reason"] != "classification_overlaps_rest_or_next_trial" else ""
+        reason = common
+        if not reason and row["anchor_s"] + ep["activity_s"][1] > row["end_s"]+1e-8:
+            reason = "activity_overlaps_rest_or_next_trial"
+        row.update(eda_status="excluded" if reason else "candidate", eda_reason=reason)
     return pd.DataFrame(rows)
 
 
@@ -181,34 +188,39 @@ def prepare_block(rec, cfg, meta):
     trials["trial_id"] = [f"{meta['subject']}/s{meta['session']:02d}/{meta['block']}/{i:04d}"
                           for i in trials.trial]
     ep, pre = cfg["epochs"], cfg["preprocessing"]
-    epochs = []
-    for idx, row in trials.loc[trials.status == "candidate"].iterrows():
-        baseline = segment(filtered, rec, row.baseline_start_s, row.baseline_end_s)
-        task = segment(filtered, rec, row.anchor_s+ep["activity_s"][0], row.anchor_s+ep["activity_s"][1])
-        class_epoch = segment(cls, rec, row.anchor_s+ep["classification_s"][0],
-                              row.anchor_s+ep["classification_s"][1])
-        broad_class = segment(filtered, rec, row.anchor_s+ep["classification_s"][0],
-                              row.anchor_s+ep["classification_s"][1])
-        windows = (baseline, task, broad_class)
-        reason = ""
+    def artifact_reason(windows):
         known_unit = cfg["input"]["eeg_unit"] != "native"
         if known_unit and any(np.ptp(x, axis=1).max()*1e6 > pre["reject_peak_to_peak_uv"] for x in windows):
-            reason = "high_peak_to_peak"
-        elif any(x.std(axis=1).min()*1e6 <= (pre["reject_flat_std_uv"] if known_unit else 0.) for x in windows):
-            reason = "flat_channel"
-        trials.at[idx, "reason"] = reason
-        trials.at[idx, "status"] = "excluded" if reason else "accepted"
-        if not reason:
-            epochs.append(class_epoch)
-    accepted = trials.loc[trials.status == "accepted"].reset_index(drop=True)
+            return "high_peak_to_peak"
+        if any(x.std(axis=1).min()*1e6 <= (pre["reject_flat_std_uv"] if known_unit else 0.) for x in windows):
+            return "flat_channel"
+        return ""
+
+    epochs = []
+    for idx, row in trials.iterrows():
+        for status, reason_column, window in (("status", "reason", "classification_s"),
+                                               ("eda_status", "eda_reason", "activity_s")):
+            if row[status] != "candidate":
+                continue
+            baseline = segment(filtered, rec, row.baseline_start_s, row.baseline_end_s)
+            activity = segment(filtered, rec, row.anchor_s+ep[window][0], row.anchor_s+ep[window][1])
+            reason = artifact_reason((baseline, activity))
+            trials.at[idx, reason_column] = reason
+            trials.at[idx, status] = "excluded" if reason else "accepted"
+            if status == "status" and not reason:
+                epochs.append(segment(cls, rec, row.anchor_s+ep[window][0], row.anchor_s+ep[window][1]))
     trials["physical_amplitude_qc_applied"] = cfg["input"]["eeg_unit"] != "native"
+    accepted = trials.loc[trials.status == "accepted"].reset_index(drop=True)
+    eda_accepted = trials.loc[trials.eda_status == "accepted"].reset_index(drop=True)
     n_samples = int(round(2*rec.sfreq))
     X = np.stack(epochs) if epochs else np.empty((0, len(names), n_samples))
-    block = EpochBlock(meta, names, rec.sfreq, X, accepted)
+    block = EpochBlock(meta, names, rec.sfreq, X, accepted, eda_accepted)
     return block, trials, raw, filtered, qc
 
 
 def spectral_summary(rec, filtered, block, cfg, with_tfr=False):
+    if block.eda_trials is not None:
+        block = replace(block, trials=block.eda_trials)
     spec, ep = cfg["spectral"], cfg["epochs"]
     nperseg = int(round(spec["welch_window_s"]*rec.sfreq))
     noverlap = int(round(nperseg*spec["overlap"]))
