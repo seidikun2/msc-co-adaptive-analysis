@@ -36,6 +36,36 @@ def _concat(frames):
     return frames[0].iloc[:0] if frames else pd.DataFrame()
 
 
+def diagnose(table, cfg, destination, overwrite=False):
+    """QC por arquivo, sem relatórios pesados; erros não impedem examinar os seguintes."""
+    destination = Path(destination)
+    if destination.exists() and not overwrite:
+        raise ValueError(f"{destination} já existe; use outro --output ou --overwrite.")
+    results = []
+    for row in table.itertuples():
+        item = dict(path=row.path, subject=row.subject, session=int(row.session), block=row.block)
+        try:
+            rec = read_recording(row.path, cfg)
+            item["event_counts"] = {str(int(k)): int(v) for k, v in rec.events.code.value_counts().items()}
+            block, trials, *_ = prepare_block(rec, cfg, dict(
+                subject=row.subject, group=row.group, session=int(row.session), block=row.block))
+            reasons = trials.loc[trials.status == "excluded", "reason"].value_counts().to_dict()
+            item.update(status="ok", n_trials=len(trials), n_accepted=len(block.X),
+                        rejection_reasons=reasons,
+                        trials=json.loads(trials.to_json(orient="records", double_precision=10)))
+            print(f"{row.subject} · s{row.session}/{row.block}: "
+                  f"{len(block.X)}/{len(trials)} aceitas; exclusões: {reasons}", flush=True)
+        except (ValueError, OSError, KeyError) as exc:
+            item.update(status="error", error=str(exc))
+            print(f"{row.path}: ERRO: {exc}", flush=True)
+        results.append(item)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(results, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    print(f"Diagnóstico salvo: {destination}", flush=True)
+    if any(r["status"] == "error" for r in results):
+        raise ValueError(f"Há arquivos com erro. Diagnóstico completo preservado em {destination}.")
+
+
 def _draw_block(report, rec, raw, filtered, block, trials, events, summary, powers, cfg):
     from eeg_figures import (raw_plot, timing_plot, spectral_plot, tfr_plot,
                              erd_curve_plot, topomap_plot)
@@ -105,6 +135,10 @@ def analyze_subject(table, cfg, overwrite=False):
             print(f"{subject} · sessão {row.session} · {row.block}: lendo {Path(row.path).name}", flush=True)
             rec = read_recording(row.path, cfg)
             block, trials, raw, filtered, qc = prepare_block(rec, cfg, meta)
+            print(f"  {len(block.X)}/{len(trials)} tentativas aceitas", flush=True)
+            reasons = trials.loc[trials.status == "excluded", "reason"].value_counts().to_dict()
+            if reasons:
+                print(f"  Motivos de exclusão: {reasons}", flush=True)
             kind = "online" if row.block.startswith("online") else row.block
             draw = cfg["figures"]["selection"] == "all" or kind not in selected
             selected.add(kind)
@@ -127,7 +161,6 @@ def analyze_subject(table, cfg, overwrite=False):
             if draw:
                 _draw_block(report, rec, raw, filtered, block, trials, events, summary, powers, cfg)
             blocks.append(block)
-            print(f"  {len(block.X)}/{len(trials)} tentativas aceitas", flush=True)
         present = {(r["session"], r["block"]) for r in inventory}
         missing = [dict(subject=subject, group=table.group.iloc[0], session=s, block=b, status="missing")
                    for s in range(1, 7) for b in BLOCKS if (s, b) not in present]
@@ -243,7 +276,7 @@ def make_demo(output, base_cfg):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["inspect", "run", "demo"])
+    parser.add_argument("command", choices=["inspect", "diagnose", "run", "demo"])
     parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")))
     parser.add_argument("--data", help="Sobrescreve paths.data; aceita árvore com pastas de sujeitos.")
     parser.add_argument("--output", help="Sobrescreve paths.output; para demo é a pasta da demonstração.")
@@ -279,8 +312,11 @@ def main():
             table = table.loc[table.subject == args.subject]
             if table.empty:
                 raise ValueError(f"Sujeito não encontrado: {args.subject}")
-        for _, subject_table in table.groupby("subject", sort=True):
-            analyze_subject(subject_table, cfg, args.overwrite)
+        if args.command == "diagnose":
+            diagnose(table, cfg, Path(cfg["paths"]["output"]) / "diagnostics.json", args.overwrite)
+        else:
+            for _, subject_table in table.groupby("subject", sort=True):
+                analyze_subject(subject_table, cfg, args.overwrite)
 
 
 if __name__ == "__main__":

@@ -184,6 +184,34 @@ Sem `--subject`, processa todos os sujeitos encontrados, um de cada vez.
 Caminhos no YAML são relativos ao próprio YAML; caminhos da linha de comando
 são relativos ao diretório de execução. Parâmetros de linha de comando têm prioridade.
 
+### Diagnosticar arquivos vazios ou tentativas excluídas
+
+`run` mostra a contagem por motivo de exclusão no terminal, inclusive quando
+nenhuma tentativa online é aceita. Não substitui marcadores nem encurta as janelas
+para aceitar dados. Um erro de CSV vazio inclui o caminho completo e interrompe
+a análise, sem publicar relatório parcial como concluído.
+
+Para examinar todos os blocos mesmo se houver arquivos inválidos, sem gerar
+figuras ou treinar classificadores:
+
+```bash
+python run_analysis.py diagnose --data "/home/seidi/Área de trabalho/Dados Seidi" --subject AL106 --output results/diagnostico
+```
+
+O comando salva um único `diagnostics.json` com erros por caminho, contagens de
+marcadores, motivos de exclusão e tempos/status de cada tentativa (sem amostras
+EEG). Se encontrar erros de leitura, conclui a inspeção e retorna código de erro
+após salvar o diagnóstico. Use outro destino ou `--overwrite` para repetir.
+O arquivo contém identificações dos sujeitos: mantenha-o local e compartilhe
+somente os trechos necessários, anonimizados.
+
+`missing_task_start` indica ausência do marcador motor configurado dentro da
+tentativa; `short_attention_baseline`, atenção pré-cue insuficiente;
+`activity_overlaps_rest_or_next_trial`, janela que invade pausa/próxima tentativa.
+Esses motivos exigem conferir o protocolo e os marcadores reais. `0/N` sozinho
+não identifica a causa. CSV vazio/sem cabeçalho exige conferir ou refazer a
+exportação original; não é interpretado como um bloco sem tentativas.
+
 Cada sujeito recebe somente cinco arquivos em `results/EG102/`:
 
 | Arquivo | Conteúdo |

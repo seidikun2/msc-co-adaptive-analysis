@@ -63,12 +63,20 @@ def read_frame(path, cfg):
         except csv.Error:
             sep = ","
     # Strings nos eventos: não perder códigos compostos, como 769:32779.
-    header = pd.read_csv(path, sep=sep, nrows=0, encoding="utf-8-sig")
+    def read_csv(**kwargs):
+        try:
+            return pd.read_csv(path, sep=sep, encoding="utf-8-sig", **kwargs)
+        except pd.errors.EmptyDataError as exc:
+            raise ValueError(f"CSV vazio ou sem cabeçalho legível: {path}. "
+                             "Confira o arquivo original/exportação; nenhuma gravação foi ignorada.") from exc
+        except pd.errors.ParserError as exc:
+            raise ValueError(f"CSV inválido: {path}: {exc}") from exc
+
+    header = read_csv(nrows=0)
     event_cols = [c for c in header if _normal(c).startswith("event")]
     event_cols += [options[k] for k in ("event_id_column", "event_date_column",
                                       "event_duration_column") if options.get(k)]
-    frame = pd.read_csv(path, sep=sep, decimal=options["decimal"],
-                        dtype={c: str for c in event_cols}, encoding="utf-8-sig")
+    frame = read_csv(decimal=options["decimal"], dtype={c: str for c in event_cols})
     frame.columns = [str(c).strip() for c in frame.columns]
     return frame
 

@@ -451,3 +451,48 @@ def test_exclusion_patterns_require_a_list_of_strings(tmp_path, cfg, patterns):
     cfg['input']['exclude_globs'] = patterns
     with pytest.raises(ValueError, match='input.exclude_globs deve ser uma lista'):
         discover(cfg)
+
+
+@pytest.mark.parametrize('content', ['', '\n \n', '\ufeff'])
+def test_empty_recording_error_names_the_file(tmp_path, cfg, content):
+    path = tmp_path / 'motor_me_TEST_3.csv'
+    path.write_text(content, encoding='utf-8')
+    with pytest.raises(ValueError, match='CSV vazio ou sem cabeçalho') as error:
+        read_recording(path, cfg)
+    assert str(path) in str(error.value)
+
+
+def test_diagnostics_preserve_rejection_reasons_and_continue_after_empty_file(tmp_path, cfg):
+    import json
+    from run_analysis import diagnose
+    cfg['paths'].update(data=str(tmp_path), manifest=None)
+    rec = recording(cfg)
+    for name, omit_task in [('motor_mi_TEST_1.csv', False),
+                            ('motor_mi_TEST_online_1a.csv', True)]:
+        frame = pd.DataFrame(rec.signal.T, columns=cfg['input']['channels'])
+        frame.insert(0, 'Time:128Hz', rec.times)
+        frame['Event Id'] = ''
+        frame['Event Date'] = ''
+        frame['Event Duration'] = ''
+        for event in rec.events.itertuples():
+            if omit_task and event.code == 33027:
+                continue
+            index = round(event.time_s * rec.sfreq)
+            frame.loc[index, ['Event Id', 'Event Date', 'Event Duration']] = [
+                str(event.code), str(event.time_s), '0']
+        frame.to_csv(tmp_path / name, index=False)
+    (tmp_path / 'motor_me_TEST_1.csv').write_text('')
+    destination = tmp_path / 'qc' / 'diagnostics.json'
+    with pytest.raises(ValueError, match='Diagnóstico completo preservado'):
+        diagnose(discover(cfg), cfg, destination)
+    results = json.loads(destination.read_text())
+    assert results[0]['status'] == 'error'
+    assert 'motor_me_TEST_1.csv' in results[0]['error']
+    assert results[1]['n_accepted'] == 6
+    assert results[2]['n_accepted'] == 0
+    assert results[2]['rejection_reasons'] == {'missing_task_start': 6}
+    assert len(results[2]['trials']) == 6
+    previous = destination.read_bytes()
+    with pytest.raises(ValueError, match='já existe'):
+        diagnose(discover(cfg), cfg, destination)
+    assert destination.read_bytes() == previous
